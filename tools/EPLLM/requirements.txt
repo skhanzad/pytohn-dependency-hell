@@ -1,0 +1,8 @@
+# EPLLM: LangGraph + multi-agent + RAG (enhances pllm)
+# Install from tools/EPLLM or repo root: pip install -r tools/EPLLM/requirements.txt
+# Pllm dependencies are required (install from tools/pllm or use same env as pllm).
+
+langgraph>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+docarray>=0.16.0

@@ -1,5 +1,6 @@
 # Agent 1: Analyzes the Python file and produces initial llm_eval (python_version + python_modules).
 # Uses RAG to augment context when available.
+import re
 from typing import Optional
 
 from langchain_core.runnables.config import RunnableConfig
@@ -23,14 +24,31 @@ def analyze_file_node(state: EPLLMState, config: Optional[RunnableConfig] = None
     if deps:
         scraped_imports = deps.find_word_in_file(file_path, "import", [])
 
-    # Initial LLM evaluation
+    # Initial LLM evaluation (may return None if hallucinating)
     llm_eval = ollama_helper.evaluate_file(file_path)
-    llm_eval["python_version"] = str(llm_eval["python_version"])
+
+    # Fallback when LLM fails or returns garbage: use scraped imports + default version
+    if not llm_eval:
+        llm_eval = {"python_version": "3.8", "python_modules": []}
+
+    llm_eval["python_version"] = str(llm_eval.get("python_version", "3.8"))
+    # Validate python_version format (reject hallucinated values like "=>, 1 1-ure...")
+    if not re.match(r"^\d+\.\d+", llm_eval["python_version"]):
+        llm_eval["python_version"] = "3.8"
+
     python_modules = llm_eval.get("python_modules")
     if isinstance(python_modules, dict):
         llm_eval["python_modules"] = list(python_modules.keys()) if python_modules else []
+    elif not isinstance(python_modules, list):
+        llm_eval["python_modules"] = []
 
-    # Merge scraped imports and normalize via PyPI
+    # Filter out garbage module names (hallucinated strings)
+    llm_eval["python_modules"] = [
+        m for m in llm_eval["python_modules"]
+        if isinstance(m, str) and len(m) < 50 and re.match(r"^[a-zA-Z0-9_.-]+$", m)
+    ]
+
+    # Merge scraped imports and normalize via PyPI (scraped_imports is reliable)
     if pypi:
         combined = pypi.check_module_name(scraped_imports + list(llm_eval.get("python_modules", [])))
         llm_eval["python_modules"] = combined

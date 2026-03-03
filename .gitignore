@@ -164,3 +164,7 @@ dev/mlx-examples/
     
 Pipfile.lock
 GithubProjects/
+
+hard-gists/
+._hard-gists
+.python-version

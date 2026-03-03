@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 """
-EPLLM: Enhanced PLLM using LangGraph with multi-agent orchestration and RAG.
-Same CLI contract as pllm (test_executor.py); runs one Python version per process.
+EPLLM: Standalone tool (LangGraph + multi-agent + RAG).
+Does not depend on tools/pllm. Evaluate snippets and compare to pllm_results, readpy-results, pyego-results.
 """
 import argparse
 import os
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_PLLM_ROOT = _REPO_ROOT / "tools" / "pllm"
 _EPLLM_ROOT = Path(__file__).resolve().parent
+if str(_EPLLM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EPLLM_ROOT))
 
 
 def _str2bool(value):
     if isinstance(value, bool):
         return value
-    if value.lower() in ("yes", "true", "t", "y", "1"):
+    v = str(value).lower()
+    if v in ("yes", "true", "t", "y", "1"):
         return True
-    if value.lower() in ("no", "false", "f", "n", "0"):
+    if v in ("no", "false", "f", "n", "0"):
         return False
     raise argparse.ArgumentTypeError(f'Boolean value expected, got "{value}".')
 
 
 def process_args():
-    p = argparse.ArgumentParser(description="EPLLM: evaluate Python file (LangGraph + multi-agent + RAG)")
+    p = argparse.ArgumentParser(description="EPLLM: evaluate Python file (standalone, no pllm dependency)")
     p.add_argument("-f", "--file", type=str, required=True, help="Full path to the Python file to evaluate")
     p.add_argument("-b", "--base", type=str, default="http://localhost:11434", help="Ollama base URL")
     p.add_argument("-m", "--model", type=str, default="phi3:medium", help="Model name")
-    p.add_argument("-t", "--temp", type=float, default=0.7, help="Temperature")
+    p.add_argument("-t", "--temp", type=float, default=0.2, help="Temperature (lower=less hallucination, default 0.2)")
     p.add_argument("-l", "--loop", type=int, default=5, help="Max iterations for build/error loop")
     p.add_argument("-r", "--range", type=int, default=0, help="Search range for Python versions (0 = single version)")
-    p.add_argument("-ra", "--rag", type=_str2bool, default=True, help="Enable RAG (vector store over module docs)")
+    p.add_argument("-ra", "--rag", type=_str2bool, default=True, help="Enable RAG")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     return p.parse_args()
 
@@ -39,30 +40,20 @@ def process_args():
 def main():
     args = process_args()
 
-    # Load pllm and EPLLM (after parsing so -h works without pllm deps)
-    sys.path.insert(0, str(_PLLM_ROOT))
-    os.chdir(str(_PLLM_ROOT))
-    from helpers.ollama_helper_tester import OllamaHelper
-    from helpers.py_pi_query import PyPIQuery
-    from helpers.build_dockerfile import DockerHelper
-    from helpers.deps_scraper import DepsScraper
-    from test_executor import TestExecutor
-
-    sys.path.insert(0, str(_EPLLM_ROOT))
     from state import EPLLMState
     from graph import build_graph
     from rag.store import RAGStore
+    from core import OllamaHelper, PyPIQuery, DepsScraper, DockerHelper, Executor
 
     file_path = Path(args.file).resolve()
     if not file_path.exists():
         print(f"File not found: {file_path}")
         sys.exit(1)
-    file_path = str(file_path)
     file_dir = str(file_path.parent)
+    file_path = str(file_path)
     base_modules = os.path.join(file_dir, "modules")
     os.makedirs(base_modules, exist_ok=True)
 
-    # Shared pllm components (same as test_executor)
     ollama_helper = OllamaHelper(
         base_url=args.base,
         model=args.model,
@@ -74,17 +65,8 @@ def main():
     pypi = PyPIQuery(logging=bool(args.verbose), base_modules=base_modules)
     deps = DepsScraper(logging=bool(args.verbose))
     docker_helper = DockerHelper(logging=bool(args.verbose))
-    executor = TestExecutor(
-        base_url=args.base,
-        model=args.model,
-        logging=bool(args.verbose),
-        temp=args.temp,
-        end_loop=args.loop,
-        search_range=args.range,
-        base_modules=base_modules,
-    )
+    executor = Executor(base_modules=base_modules, logging=bool(args.verbose))
 
-    # RAG store over module version files (built after first resolve_versions in practice)
     rag_store = RAGStore(base_modules_dir=base_modules, base_url=args.base)
     if args.rag:
         rag_store.build_from_modules_dir()

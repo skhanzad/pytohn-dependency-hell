@@ -41,10 +41,15 @@ class TestExecutor():
     def evaluate_file(self, llm, file):
         # First LLM pass- Evaluates the Python file and gives us the initial JSON
         llm_eval = llm.evaluate_file(file)
-        llm_eval['python_version'] = str(llm_eval['python_version'])
+        if not llm_eval:
+            # Fallback when LLM hallucinates: use scraped imports + default
+            deps = llm.pypi.deps if hasattr(llm.pypi, 'deps') else None
+            scraped = deps.find_word_in_file(file, "import", []) if deps else []
+            llm_eval = {"python_version": "3.8", "python_modules": scraped}
+        llm_eval['python_version'] = str(llm_eval.get('python_version', '3.8'))
 
         # Should normally be a list. Re-format to a list if it is a dict.
-        python_modules = llm_eval['python_modules']
+        python_modules = llm_eval.get('python_modules', [])
         if type(python_modules) == dict:
             list_modules = []
             for module in python_modules:

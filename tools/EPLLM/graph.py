@@ -2,7 +2,6 @@
 from typing import Literal
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 
 from state import EPLLMState
 from agents.analyzer import analyze_file_node
@@ -47,4 +46,4 @@ def build_graph():
     graph.add_conditional_edges("run_container", _route_after_run, {"__end__": END, "handle_error": "handle_error"})
     graph.add_conditional_edges("handle_error", _route_after_handle_error, {"build": "build", "__end__": END})
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile()

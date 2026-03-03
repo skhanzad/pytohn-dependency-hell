@@ -24,6 +24,10 @@ class PyPIQuery:
         self.base_modules = base_modules
 
     def check_format(self, python_version):
+        # Normalize version specifiers like ">=3.5,<4" to "3.5"
+        match = re.search(r'(\d+)\.(\d+)', str(python_version))
+        if match:
+            python_version = f"{match.group(1)}.{match.group(2)}"
         python_version = python_version.replace('+', '')
         split_version = python_version.split('.')
         if len(split_version) == 1:

@@ -3,8 +3,8 @@
 import argparse
 import re
 
-from helpers.ollama_helper_base import OllamaHelperBase
-from helpers.py_pi_query import PyPIQuery
+from .ollama_helper_base import OllamaHelperBase
+from .py_pi_query import PyPIQuery
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -61,6 +61,7 @@ class OllamaHelper(OllamaHelperBase):
         pv = out.get("python_version")
         if not pv or not isinstance(pv, str):
             return False
+        # python_version must look like 3.8, 2.7, 3.11, etc.
         if not re.match(r"^\d+\.\d+", pv.strip()):
             return False
         if len(pv) > 10:
@@ -70,7 +71,7 @@ class OllamaHelper(OllamaHelperBase):
             if not isinstance(pm, (list, dict)):
                 return False
             items = list(pm.keys()) if isinstance(pm, dict) else pm
-            for m in items[:10]:
+            for m in items[:10]:  # sample first 10
                 s = str(m) if m is not None else ""
                 if len(s) > 50 or not re.match(r"^[a-zA-Z0-9_.-]+$", s):
                     return False
@@ -79,6 +80,7 @@ class OllamaHelper(OllamaHelperBase):
     # Initial Python file handler, gets first set of modules and Python version
     def evaluate_file(self, python_file):
         raw_file = self.read_python_file(python_file)
+        # Truncate to avoid context pollution / hallucination from long unrelated code
         if len(raw_file) > 3000:
             raw_file = raw_file[:3000] + "\n... (truncated)"
         
@@ -106,6 +108,7 @@ class OllamaHelper(OllamaHelperBase):
             except Exception as e:
                 if self.logging:
                     print(f"evaluate_file attempt {attempt + 1}: {e}")
+        # Return None to signal failure; analyzer will use scraped imports + default
         return None
 
 
@@ -146,7 +149,7 @@ class OllamaHelper(OllamaHelperBase):
                         updated_modules[module] = "0.0.0"
                         continue
 
-                    # Deterministic fallback: pick latest when list is short (avoids LLM)
+                    # Deterministic fallback: pick latest version when list is short (avoids LLM entirely)
                     version_list = [v.strip() for v in versions.split(",") if v.strip()]
                     if version_list and len(version_list) <= 100:
                         updated_modules[module] = version_list[-1].split(" ")[0].split(",")[0]
@@ -159,8 +162,11 @@ class OllamaHelper(OllamaHelperBase):
                         pv = {"version_details": versions[:2000], "module": module}
 
                     prompt = PromptTemplate(template=tp, input_variables=[], partial_variables=pv)
+
+                    # Use Ollama JSON schema to enforce output structure and reduce hallucination
+                    schema = ModuleVersion.model_json_schema()
                     try:
-                        structured_model = self.model.bind(format=ModuleVersion.model_json_schema())
+                        structured_model = self.model.bind(format=schema)
                     except Exception:
                         structured_model = self.model
                     chain = prompt | structured_model | parser
@@ -185,7 +191,7 @@ class OllamaHelper(OllamaHelperBase):
                 completed = False
                 attempts -= 1
                 updated_modules = {}
-
+            
             if attempts <= 0:
                 print("Failed to find versions")
                 raise RuntimeError("Could not resolve module versions after 5 attempts")
@@ -281,6 +287,7 @@ class OllamaHelper(OllamaHelperBase):
 
                 if out and (out.get('version') is None or self.is_valid_version(out['version'])):
                     return out
+                # return out
             except Exception as e:
                 print(f'could not find version: Error getting versions from error message: {e}')
         

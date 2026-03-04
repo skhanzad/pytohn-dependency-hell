@@ -18,6 +18,7 @@ if _pllm_dir.is_dir() and str(_pllm_dir) not in sys.path:
 from pllm.helpers.deps_scraper import DepsScraper
 from pllm.helpers.ollama_helper_tester import OllamaHelper
 from pllm.helpers.py_pi_query import PyPIQuery
+from pllm.helpers.build_dockerfile import DockerHelper
 
 def _load_module_link() -> dict:
     """Load module_link.json for canonical PyPI name mapping."""
@@ -231,17 +232,71 @@ def resolve_next_module(state: AgentState) -> dict:
         "current_module": next_module,
     }
 
+def all_resolved(state: AgentState) -> str:
+    """
+    ROUTING: Check if all modules in resolution_plan have a pinned version.
+    If yes → proceed to Build. If no → resolve next module.
+    """
+    resolution_plan = state.get("resolution_plan") or []
+    resolved_modules = state.get("resolved_modules") or {}
+    planned = {step.get("module") for step in resolution_plan if isinstance(step, dict) and step.get("module")}
+    if not planned:
+        return "docker_build"
+    if planned <= resolved_modules.keys():
+        return "docker_build"
+    return "resolve_next_module"
+
+
+def docker_build(state: AgentState) -> dict:
+    """
+    BUILDER AGENT — Generate and build Dockerfile:
+    1. Create Dockerfile with FROM python:{version}, pip installs (build_dockerfile.create_dockerfile)
+    2. Build via Docker API (build_dockerfile.build_dockerfile)
+    3. Capture full build log for error analysis
+
+    Directly maps to: DockerHelper.create_dockerfile() + DockerHelper.build_dockerfile()
+    Updates: dockerfile_content, docker_image_name, build_log, build_passed
+    """
+    file_path = state.get("file_path") or ""
+    python_version = state.get("python_version") or "3.10"
+    resolved_modules = state.get("resolved_modules") or {}
+
+    llm_out = {
+        "python_version": python_version,
+        "python_modules": resolved_modules,
+    }
+    dh = DockerHelper(logging=False, image_name="", dockerfile_name="", container_name="")
+    try:
+        dh.create_dockerfile(llm_out, file_path)
+        dockerfile_content = dh.dockerfile_out
+        docker_image_name = dh.image_name
+        build_passed, build_log = dh.build_dockerfile(file_path)
+    except Exception as e:
+        dockerfile_content = getattr(dh, "dockerfile_out", "") or ""
+        docker_image_name = getattr(dh, "image_name", "") or ""
+        build_passed = False
+        build_log = str(e)
+
+    return {
+        "dockerfile_content": dockerfile_content,
+        "docker_image_name": docker_image_name,
+        "build_log": build_log,
+        "build_passed": build_passed,
+    }
+
 def build_graph():
     """Build the LangGraph state graph."""
     builder = StateGraph(AgentState)
     builder.add_node("extract_imports", extract_imports)
     builder.add_node("plan_resolution", plan_resolution)
     builder.add_node("resolve_next_module", resolve_next_module)
+    builder.add_node("docker_build", docker_build)
 
     builder.add_edge(START, "extract_imports")
     builder.add_edge("extract_imports", "plan_resolution")
     builder.add_edge("plan_resolution", "resolve_next_module")
-    builder.add_edge("resolve_next_module", END)
+    builder.add_conditional_edges("resolve_next_module", all_resolved)
+    builder.add_edge("docker_build", END)
 
     return builder.compile()
 

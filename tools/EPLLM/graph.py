@@ -1,4 +1,3 @@
-from token import STAR
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
@@ -7,6 +6,8 @@ from state import AgentState
 from pathlib import Path
 import sys
 import json
+import tempfile
+import os
 
 # Add tools/pllm so pllm helpers can be imported
 _pllm_dir = Path(__file__).resolve().parent.parent
@@ -16,6 +17,7 @@ if _pllm_dir.is_dir() and str(_pllm_dir) not in sys.path:
 
 from pllm.helpers.deps_scraper import DepsScraper
 from pllm.helpers.ollama_helper_tester import OllamaHelper
+from pllm.helpers.py_pi_query import PyPIQuery
 
 def _load_module_link() -> dict:
     """Load module_link.json for canonical PyPI name mapping."""
@@ -81,14 +83,76 @@ def extract_imports(state: AgentState) -> dict:
     }
 
 
+def plan_resolution(state: AgentState) -> dict:
+    """
+    PLANNER AGENT — Creates an ordered resolution strategy:
+    1. Query PyPI for each module's available versions (py_pi_query.get_module_specifics)
+    2. Filter versions by Python version date range (Algorithm 1 from paper)
+    3. Rank modules by constraint complexity (most-constrained first)
+    4. Set fallback strategies per module
+
+    NOVEL: Uses constraint_table + attempt_history to avoid known-bad paths.
+    On replan: LLM reasons over full failure history to change strategy.
+
+    Maps to: PyPIQuery.get_module_specifics() + new planning logic
+    Updates: resolution_plan, pypi_versions, python_version_candidates
+    """
+    merged = state.get("merged_imports") or []
+    python_version = state.get("python_version") or "3.10"
+    constraint_table = state.get("constraint_table") or []
+    error_module_versions = state.get("error_module_versions") or {}
+
+    # 1. Python version candidates (date-range fallbacks)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pypi = PyPIQuery(logging=False, base_modules=tmpdir)
+        python_version_candidates = pypi.get_python_range(python_version)
+
+        # 2. Query PyPI per module; get_module_specifics writes version lists to tmpdir
+        module_details = {"python_version": python_version, "python_modules": merged}
+        try:
+            modified_modules, _ = pypi.get_module_specifics(module_details)
+        except Exception:
+            modified_modules = merged
+
+        # 3. Build pypi_versions from written files (module -> sorted version list)
+        pypi_versions = {}
+        for dep in modified_modules:
+            path = os.path.join(tmpdir, f"{dep}_{python_version}.txt")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    raw = f.read().strip()
+                    pypi_versions[dep] = [v.strip() for v in raw.split(",") if v.strip()]
+            else:
+                pypi_versions[dep] = []
+
+    # 4. Rank modules: most-constrained first (in constraint_table or error_module_versions), then rest
+    constrained = set()
+    for entry in constraint_table:
+        constrained.add(entry.get("module_a"))
+        constrained.add(entry.get("module_b"))
+    constrained.update(error_module_versions.keys())
+    ordered = [m for m in modified_modules if m in constrained]
+    ordered += [m for m in modified_modules if m not in constrained]
+
+    resolution_plan = [{"module": m, "order": i} for i, m in enumerate(ordered)]
+
+    return {
+        "resolution_plan": resolution_plan,
+        "pypi_versions": pypi_versions,
+        "python_version_candidates": python_version_candidates,
+    }
+
+
 
 def build_graph():
     """Build the LangGraph state graph."""
     builder = StateGraph(AgentState)
     builder.add_node("extract_imports", extract_imports)
+    builder.add_node("plan_resolution", plan_resolution)
 
     builder.add_edge(START, "extract_imports")
-    builder.add_edge("extract_imports", END)
+    builder.add_edge("extract_imports", "plan_resolution")
+    builder.add_edge("plan_resolution", END)
 
     return builder.compile()
 

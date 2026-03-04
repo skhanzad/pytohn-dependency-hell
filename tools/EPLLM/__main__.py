@@ -30,8 +30,8 @@ def main():
         help="Ollama URL (default: http://localhost:11434)"
     )
     parser.add_argument(
-        "-l", "--loop", type=int, default=5,
-        help="Max iterations per snippet (default: 5)"
+        "-l", "--loop", type=int, default=8,
+        help="Max iterations per snippet (default: 8)"
     )
     parser.add_argument(
         "-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1),

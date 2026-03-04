@@ -48,7 +48,30 @@ class ErrorParser:
         "apt", "apt_pkg", "aptdaemon", "software_properties",
         "xdg", "Xlib", "cairo", "pango", "atk", "wnck",
         "gconf", "gnome", "gnomekeyring", "pynotify",
+        # Local / non-pip modules commonly found in gists
+        "input_data", "util", "utils", "helper", "helpers", "config",
+        "settings", "models", "views", "urls", "forms", "admin",
+        "blog_main", "webapp2", "conf", "local_settings",
+        # Cinema 4D, Maya, Blender, etc. (non-pip)
+        "c4d", "c4ddev", "maya", "pymel", "cmds", "bpy",
+        "nuke", "houdini", "hou", "substance",
+        # Sublime Text plugins
+        "sublime", "sublime_plugin",
+        # RPi-specific
+        "RPi", "smbus", "spidev", "wiringpi",
+        # IDE / runtime-only modules
+        "rospy", "roslib", "catkin", "odbaccess", "abaqus",
+        # Google App Engine
+        "google.appengine",
     }
+
+    # Additional patterns for build errors
+    COULD_NOT_BUILD = re.compile(
+        r"Could not build wheels for (\S+)", re.IGNORECASE
+    )
+    NO_MATCHING_DIST = re.compile(
+        r"No matching distribution found for (\S+)==(\S+)"
+    )
 
     def detect_python2(self, source_code: str) -> bool:
         """Heuristic Python 2 detection from source code."""
@@ -116,7 +139,32 @@ class ErrorParser:
         if self.SYNTAX_ERROR.search(log):
             return ("SyntaxError", None, None)
 
+        # Additional patterns
+        m = self.COULD_NOT_BUILD.search(log)
+        if m:
+            mod = m.group(1).split("==")[0].split(">")[0].split("<")[0]
+            return ("NonZeroCode", mod, None)
+
+        m = self.NO_MATCHING_DIST.search(log)
+        if m:
+            return ("VersionNotFound", m.group(1), m.group(2))
+
         return ("None", None, None)
+
+    def extract_traceback_module(self, log: str, resolved_modules: dict) -> Optional[str]:
+        """Try to identify the failing module from a traceback by matching
+        against resolved module names in site-packages paths."""
+        # Match site-packages/module_name in traceback
+        matches = re.findall(r"site-packages/([a-zA-Z0-9_]+)", log)
+        for match in matches:
+            mod = match.lower()
+            if mod in resolved_modules:
+                return mod
+            # Check if any resolved module starts with this name
+            for rm in resolved_modules:
+                if rm.lower().startswith(mod) or mod.startswith(rm.lower()):
+                    return rm
+        return None
 
     def extract_available_versions(self, log: str) -> List[str]:
         """Extract version list from 'from versions: ...' in error messages."""

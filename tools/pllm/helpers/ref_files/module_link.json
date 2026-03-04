@@ -265,5 +265,17 @@
     },
     "yaml": {
         "ref": "pyyaml"
+    },
+    "image": {
+        "ref": "pillow"
+    },
+    "wx": {
+        "ref": "wxpython"
+    },
+    "OpenSSL": {
+        "ref": "pyopenssl"
+    },
+    "Crypto": {
+        "ref": "pycryptodome"
     }
 }

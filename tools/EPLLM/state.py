@@ -17,3 +17,4 @@ class SnippetState(TypedDict, total=False):
     iteration: int
     max_iterations: int
     status: str  # 'pending', 'building', 'running', 'success', 'failed'
+    llm_recoveries: int  # number of LLM-assisted recoveries used

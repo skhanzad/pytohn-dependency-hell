@@ -64,7 +64,7 @@ class Evaluator:
                  output_csv: str = "epllm-results/epllm_results.csv",
                  base_url: str = "http://localhost:11434",
                  model: str = "gemma2", temp: float = 0.2,
-                 max_iterations: int = 5, jobs: int = 1,
+                 max_iterations: int = 8, jobs: int = 1,
                  limit: Optional[int] = None,
                  modules_dir: str = "./modules",
                  logging: bool = False):

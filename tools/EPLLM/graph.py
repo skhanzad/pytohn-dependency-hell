@@ -9,9 +9,16 @@ import json
 import re
 import tempfile
 import os
+from dotenv import load_dotenv
 
-# Python 2 stdlib modules (not on PyPI; filter when target is 2.x)
-_PY2_STDLIB = frozenset({"urllib2", "urlparse", "htmlparser", "httplib", "htmlentitydefs", "cookielib", "copy_reg", "queue", "socketserver", "tkinter", "ttk", "Tkinter"})
+load_dotenv()
+
+# Set to True or use env EPLLM_DEBUG=1 for verbose node output
+_DEBUG = os.environ.get("EPLLM_DEBUG", "").strip() in ("1", "true", "yes")
+
+def _log(tag: str, msg: str, *args) -> None:
+    if _DEBUG:
+        print(f"[EPLLM:{tag}] {msg}", *args)
 
 # Add tools/pllm so pllm helpers can be imported
 _pllm_dir = Path(__file__).resolve().parent.parent
@@ -80,19 +87,14 @@ def extract_imports(state: AgentState) -> dict:
     combined = _apply_module_link(raw_imports, known_modules) + _apply_module_link(llm_imports, known_modules)
     merged_imports = deps.clean_deps(list(dict.fromkeys(combined)))  # dedupe order-preserving
 
-    # 4. For Python 2 target, drop known Py2 stdlib (urllib2 etc.) so we don't try to pip install them
-    standard_lib_modules: list[str] = []
-    if python_version.startswith("2."):
-        kept = [m for m in merged_imports if m.lower() not in _PY2_STDLIB]
-        standard_lib_modules = [m for m in merged_imports if m.lower() in _PY2_STDLIB]
-        merged_imports = kept
+    _log("extract_imports", "file_path=%s python_version=%s", file_path, python_version)
+    _log("extract_imports", "raw_imports=%s llm_imports=%s merged_imports=%s", raw_imports, llm_imports, merged_imports)
 
     return {
         "raw_imports": raw_imports,
         "llm_imports": llm_imports,
         "merged_imports": merged_imports,
         "python_version": python_version,
-        "standard_lib_modules": standard_lib_modules,
     }
 
 
@@ -149,6 +151,9 @@ def plan_resolution(state: AgentState) -> dict:
 
     resolution_plan = [{"module": m, "order": i} for i, m in enumerate(ordered)]
 
+    _log("plan_resolution", "python_version=%s candidates=%s", python_version, python_version_candidates)
+    _log("plan_resolution", "resolution_plan=%s pypi_versions keys=%s", resolution_plan, list(pypi_versions.keys()))
+
     return {
         "resolution_plan": resolution_plan,
         "pypi_versions": pypi_versions,
@@ -169,13 +174,15 @@ def replan(state: AgentState) -> str:
     """
     iteration = state.get("iteration") or 0
     max_iterations = state.get("max_iterations") or 10
-    if iteration >= max_iterations:
-        return END
     strategy = (state.get("suggested_strategy") or "").strip().lower()
+    _log("replan", "iteration=%s/%s strategy=%s", iteration, max_iterations, strategy)
+    if iteration >= max_iterations:
+        _log("replan", "-> END (max iterations)")
+        return END
     if strategy == "replan":
+        _log("replan", "-> plan_resolution")
         return "plan_resolution"
-    if strategy in ("swap_version", "add_module"):
-        return "resolve_next_module"
+    _log("replan", "-> resolve_next_module")
     return "resolve_next_module"
 
 
@@ -209,6 +216,7 @@ def resolve_next_module(state: AgentState) -> dict:
             break
 
     if not next_module:
+        _log("resolve_next_module", "no next module (all resolved)")
         return {"current_module": None, "resolved_modules": resolved_modules}
 
     # 2. Candidate versions: exclude failed_combos and error_module_versions
@@ -220,6 +228,7 @@ def resolve_next_module(state: AgentState) -> dict:
     ]
     if not candidate_versions:
         candidate_versions = all_versions
+    _log("resolve_next_module", "next_module=%s candidates=%s", next_module, len(candidate_versions))
 
     # 3. Use OllamaHelper.get_module_versions(): write filtered list to temp file, then call
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -239,6 +248,7 @@ def resolve_next_module(state: AgentState) -> dict:
         else:
             resolved_modules[next_module] = "0.0.0"
 
+    _log("resolve_next_module", "pinned %s=%s", next_module, resolved_modules.get(next_module))
     return {
         "resolved_modules": resolved_modules,
         "current_module": next_module,
@@ -252,9 +262,9 @@ def all_resolved(state: AgentState) -> str:
     resolution_plan = state.get("resolution_plan") or []
     resolved_modules = state.get("resolved_modules") or {}
     planned = {step.get("module") for step in resolution_plan if isinstance(step, dict) and step.get("module")}
-    if not planned:
-        return "docker_build"
-    if planned <= resolved_modules.keys():
+    done = planned <= resolved_modules.keys()
+    _log("all_resolved", "planned=%s resolved_keys=%s -> %s", planned, set(resolved_modules.keys()), "docker_build" if done else "resolve_next_module")
+    if not planned or done:
         return "docker_build"
     return "resolve_next_module"
 
@@ -292,6 +302,9 @@ def docker_build(state: AgentState) -> dict:
         build_passed = False
         build_log = str(e)
 
+    _log("docker_build", "pip_modules=%s build_passed=%s image=%s", pip_modules, build_passed, docker_image_name)
+    if build_log and not build_passed:
+        _log("docker_build", "build_log (snippet): %s", build_log[:200])
     return {
         "dockerfile_content": dockerfile_content,
         "docker_image_name": docker_image_name,
@@ -305,9 +318,9 @@ def build_passed_route(state: AgentState) -> str:
     ROUTING: Did Docker build succeed without errors?
     If build_passed → docker_run. Else → diagnose_error (build failure).
     """
-    if state.get("build_passed"):
-        return "docker_run"
-    return "diagnose_error"
+    out = "docker_run" if state.get("build_passed") else "diagnose_error"
+    _log("build_passed_route", "build_passed=%s -> %s", state.get("build_passed"), out)
+    return out
 
 
 def diagnose_error(state: AgentState) -> dict:
@@ -385,6 +398,8 @@ def diagnose_error(state: AgentState) -> dict:
             failed_combos.add((error_module, str(error_version)))
             error_module_versions.setdefault(error_module, []).append(str(error_version))
 
+    _log("diagnose_error", "source=%s error_type=%s error_module=%s error_version=%s suggested_strategy=%s",
+         "build_log" if not build_passed else "run_log", error_type, error_module, error_version, suggested_strategy)
     return {
         "error_type": error_type,
         "error_module": error_module,
@@ -430,6 +445,9 @@ def docker_run(state: AgentState) -> dict:
             )
         except Exception as e:
             run_log = str(e)
+    _log("docker_run", "image=%s run_passed=%s run_log_len=%s", docker_image_name, run_passed, len(run_log))
+    if run_log and not run_passed:
+        _log("docker_run", "run_log (snippet): %s", run_log[:200])
     return {"run_log": run_log, "run_passed": run_passed}
 
 
@@ -438,9 +456,9 @@ def run_passed_route(state: AgentState):
     ROUTING: Did the Python snippet execute without dependency errors?
     If run_passed → END (success). Else → diagnose_error (run failure).
     """
-    if state.get("run_passed"):
-        return END
-    return "diagnose_error"
+    out = END if state.get("run_passed") else "diagnose_error"
+    _log("run_passed_route", "run_passed=%s -> %s", state.get("run_passed"), "END" if out is END else out)
+    return out
 
 
 def reflect_reason(state: AgentState) -> dict:
@@ -494,6 +512,7 @@ def reflect_reason(state: AgentState) -> dict:
     elif error_type:
         root_cause_hypothesis = f"Recurring {error_type}; consider version swap or replan."
 
+    _log("reflect_reason", "notes=%s hypothesis=%s suggested_strategy=%s", reflection_notes, root_cause_hypothesis, suggested_strategy)
     return {
         "reflection_notes": reflection_notes,
         "root_cause_hypothesis": root_cause_hypothesis,
@@ -563,6 +582,8 @@ def update_memory(state: AgentState) -> dict:
         "action_taken": action_taken,
     })
 
+    _log("update_memory", "constraint_table len=%s attempt_history len=%s failed_combos=%s",
+         len(constraint_table), len(attempt_history), len(failed_combos))
     return {
         "constraint_table": constraint_table,
         "failed_combos": failed_combos,
@@ -593,6 +614,8 @@ def build_graph():
 
 
 if __name__ == "__main__":
+    if _DEBUG:
+        print("[EPLLM] Debug logging enabled (EPLLM_DEBUG=1)")
     graph = build_graph()
 
     res = graph.invoke(

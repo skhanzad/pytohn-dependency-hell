@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Run EPLLM graph on all snippets under --hard-gists and write id,name,result,duration,python_modules,passed,error to CSV.
+Uses multiprocessing to evaluate snippets in parallel.
 """
 import argparse
 import csv
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -49,6 +51,37 @@ def row_from_state(
     }
 
 
+def _run_one(args: tuple[int, str, int]) -> dict:
+    """
+    Worker: run EPLLM on a single snippet. Builds graph in-process (graph is not picklable).
+    args: (row_id, snippet_path_str, max_iterations)
+    """
+    row_id, file_path, max_iterations = args
+    if str(_epllm_dir) not in sys.path:
+        sys.path.insert(0, str(_epllm_dir))
+    from graph import build_graph as _build_graph
+
+    snippet_path = Path(file_path)
+    name = snippet_path.parent.name
+    t0 = time.perf_counter()
+    try:
+        graph = _build_graph()
+        state = graph.invoke(
+            {"file_path": file_path, "max_iterations": max_iterations}
+        )
+    except Exception as e:
+        state = {
+            "run_passed": False,
+            "build_passed": False,
+            "error_type": "Error",
+            "resolved_modules": {},
+            "run_log": str(e),
+            "build_log": "",
+        }
+    duration = time.perf_counter() - t0
+    return row_from_state(row_id, name, state, duration)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run EPLLM on hard-gists snippets and write epllm_results.csv",
@@ -85,6 +118,13 @@ def main() -> None:
         dest="max_iterations",
         help="Max build/error-handling iterations (default: 5)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: CPU count - 1, min 1)",
+    )
     args = parser.parse_args()
 
     hard_gists = args.hard_gists.resolve()
@@ -97,48 +137,38 @@ def main() -> None:
         print(f"No snippet.py files under {hard_gists}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Running EPLLM on {len(snippets)} snippets (model={args.model}, max_iterations={args.max_iterations})")
-    graph = build_graph()
+    n_jobs = args.jobs
+    if n_jobs is None:
+        n_jobs = max(1, (mp.cpu_count() or 2) - 1)
+    n_jobs = max(1, n_jobs)
 
+    print(
+        f"Running EPLLM on {len(snippets)} snippets with {n_jobs} workers "
+        f"(model={args.model}, max_iterations={args.max_iterations})"
+    )
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    task_tuples = [
+        (i, str(snippet_path.resolve()), args.max_iterations)
+        for i, snippet_path in enumerate(snippets, start=1)
+    ]
+
     fieldnames = ["id", "name", "result", "duration", "python_modules", "passed", "error"]
-    rows: list[dict] = []
+    t0_total = time.perf_counter()
+    with mp.Pool(processes=n_jobs) as pool:
+        rows = pool.map(_run_one, task_tuples)
+    elapsed = time.perf_counter() - t0_total
 
-    for i, snippet_path in enumerate(snippets, start=1):
-        name = snippet_path.parent.name
-        file_path = str(snippet_path)
-        print(f"  [{i}/{len(snippets)}] {name} ...", flush=True)
-        t0 = time.perf_counter()
-        try:
-            state = graph.invoke(
-                {
-                    "file_path": file_path,
-                    "max_iterations": args.max_iterations,
-                }
-            )
-        except Exception as e:
-            state = {
-                "run_passed": False,
-                "build_passed": False,
-                "error_type": "Error",
-                "resolved_modules": {},
-                "run_log": str(e),
-                "build_log": "",
-            }
-        duration = time.perf_counter() - t0
-        row = row_from_state(i, name, state, duration)
-        rows.append(row)
-        print(f"    -> {row['result']} ({duration:.2f}s)", flush=True)
-
+    rows.sort(key=lambda r: r["id"])
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in rows:
             writer.writerow({k: r[k] for k in fieldnames})
 
-    print(f"Wrote {len(rows)} rows to {output_path}")
+    n_passed = sum(1 for r in rows if r["passed"])
+    print(f"Wrote {len(rows)} rows to {output_path} ({n_passed} passed, {elapsed:.1f}s total)")
 
 
 if __name__ == "__main__":

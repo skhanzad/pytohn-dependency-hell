@@ -52,6 +52,52 @@ def _apply_module_link(names: list[str], known_modules: dict) -> list[str]:
     return out
 
 
+def _detect_python2(file_path: str) -> bool:
+    """
+    Heuristic: return True if the file looks like Python 2 code (so we use python:2.7 in Docker).
+    Detects: print statements without parens, raw_input, xrange, except E, e:, raise E, msg, etc.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        return False
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    # Normalize: strip so we can use line-based checks
+    lines = content.splitlines()
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        # print statement without parentheses (Py2): "print x" or "print 'x'" or "print x,y"
+        if re.search(r"\bprint\s+[^(\s].*", line) and "print(" not in line:
+            # exclude "print (" (space before paren, could be Py3)
+            if not re.search(r"\bprint\s*\(", line):
+                return True
+        # Python 2-only builtins / syntax
+        if re.search(r"\braw_input\s*\(", line):
+            return True
+        if re.search(r"\bxrange\s*\(", line):
+            return True
+        if re.search(r"\bunicode\s*\(", line):
+            return True
+        if re.search(r"\blong\s*\(", line):
+            return True
+        if re.search(r"\bbasestring\b", line):
+            return True
+        # except Exception, e:
+        if re.search(r"except\s+[^:]+,\s*\w+\s*:", line):
+            return True
+        # raise Exception, "msg"
+        if re.search(r"raise\s+[^,]+,\s*[^(\s]", line):
+            return True
+        # <> inequality (Py2)
+        if re.search(r"<\s*>", line):
+            return True
+    return False
+
+
 def extract_imports(state: AgentState) -> dict:
     """
     ANALYZER AGENT — Two-pronged import extraction:
@@ -82,7 +128,12 @@ def extract_imports(state: AgentState) -> dict:
         llm_imports = []
         python_version = state.get("python_version") or "3.10"
 
-    # 3. Merge: union of names, apply module_link, then clean_deps (filter stdlib)
+    # 3. Python 2 heuristic: if snippet looks like Py2 (e.g. print without parens), force 2.7
+    if _detect_python2(file_path):
+        python_version = "2.7"
+        _log("extract_imports", "Python 2 detected -> python_version=2.7")
+
+    # 4. Merge: union of names, apply module_link, then clean_deps (filter stdlib)
     known_modules = _load_module_link()
     combined = _apply_module_link(raw_imports, known_modules) + _apply_module_link(llm_imports, known_modules)
     merged_imports = deps.clean_deps(list(dict.fromkeys(combined)))  # dedupe order-preserving

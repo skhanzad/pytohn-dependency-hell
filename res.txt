@@ -1,0 +1,87 @@
+EPLLM: 10 rows from epllm_results.csv
+PLLM: 2891 rows from hard-gists-l10-r1-1-final.csv
+pyego: 2891 rows from pyego_results.csv
+readpy: 2891 rows from readpy_results_total.csv
+
+========================================================================
+  EPLLM  vs  PLLM  vs  pyego  vs  readpy
+========================================================================
+Metric                      EPLLM        PLLM       pyego      readpy
+------------------------------------------------------------------------
+N (snippets)                   10        2891        2891        2891
+Passed                          2        1437        1302        1365
+Pass rate %                 20.0%       49.7%       45.0%       47.2%
+Avg duration (s)             94.1       280.5         5.7       106.9
+========================================================================
+
+OVERALL (per-tool details)
+----------------------------------------------------------------------
+
+EPLLM (n=10)
+  Passed:     2 / 10  (20.0%)
+  Avg time:   94.09s
+  Result distribution:
+    VersionNotFound: 4
+    success: 2
+    ModuleNotFound: 2
+    ImportError: 1
+    DependencyConflict: 1
+
+PLLM (n=2891)
+  Passed:     1437 / 2891  (49.7%)
+  Avg time:   280.47s
+  Result distribution:
+    OtherPass: 1269
+    SyntaxError: 494
+    ImportError: 433
+    NoMatchingDistribution: 282
+    CouldNotBuildWheels: 83
+    AttributeError: 83
+    TypeError: 74
+    NameError: 68
+    OtherFailure: 45
+    DjangoPass: 26
+    InvalidRequirement: 17
+    FailedToRun: 9
+    ModuleNotFound: 8
+
+pyego (n=2891)
+  Passed:     1302 / 2891  (45.0%)
+  Avg time:   5.74s
+  Result distribution:
+    OtherPass: 1044
+    ImportError: 715
+    ModuleNotFound: 634
+    OtherFailure: 247
+    AttributeError: 144
+    SyntaxError: 41
+    NameError: 37
+    TypeError: 29
+
+readpy (n=2891)
+  Passed:     1365 / 2891  (47.2%)
+  Avg time:   106.86s
+  Result distribution:
+    OtherPass: 1194
+    Build failure: 612
+    ModuleNotFound: 492
+    ImportError: 315
+    TypeError: 94
+    NameError: 77
+    SyntaxError: 58
+    AttributeError: 48
+    NoMatchingDistribution: 1
+
+======================================================================
+INTERSECTION: 10 snippets present in all tools
+======================================================================
+
+  EPLLM: 2 / 10 passed (20.0%)
+  PLLM: 3 / 10 passed (30.0%)
+  pyego: 3 / 10 passed (30.0%)
+  readpy: 3 / 10 passed (30.0%)
+
+Agreement (on intersection):
+  All tools passed:  2
+  All tools failed:  6
+  Disagreement:      2

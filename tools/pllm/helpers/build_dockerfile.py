@@ -161,7 +161,7 @@ class DockerHelper():
         return logs.decode('utf-8')
 
 def main():
-    dh = DockerHelper(logging=True, image_name="woof:meow", dockerfile_name="", container_name="")
+    dh = DockerHelper(logging=True, image_name="pllm:latest", dockerfile_name="", container_name="")
     dh.run_container_test()
     # print(dh.query_docker())
 

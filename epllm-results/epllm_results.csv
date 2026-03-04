@@ -1,83 +1,11 @@
 id,name,result,duration,python_modules,passed,error
-1,00056d4304c58a035c87cdf5ff1e5e3e,VersionNotFound,9.80,"scrapy==2.14.1,peewee==4.0.1",False,"{""stream"":""\u001b[91mERROR: Could not find a version that satisfies the requirement scrapy==2.14.1 (from versions: 0.7, 0.8, 0.9, 0.10.4.2364, 0.12.0.2550, 0.14.1, 0.14.2, 0.14.3, 0.14.4, 0.16.0, 0.16.1, 0.16.2, 0.16.3, 0.16.4, 0.16.5, 0.18.0, 0.18.1, 0.18.2, 0.18.3, 0.18.4, 0.20.0, 0.20.1, 0.20.2, 0.22.0, 0.22.1, 0.22.2, 0.24.0, 0.24.1, 0.24.2, 0.24.3, 0.24.4, 0.24.5, 0.24.6, 1.0.0rc1, 1.0.0rc2, 1.0.0rc3, 1.0.0, 1.0.1, 1.0.2, 1.0.3, 1.0.4, 1.0.5, 1.0.6, 1.0.7, 1.1.0rc1, 1.1.0rc2, 1.1.0rc3, 1.1."
-2,000eccf3d66540d75def,OtherPass,11.11,,True,
-3,00135b0dfee0ae165ad2,Failed,32.66,"pyqt4==0.0.0,maya==0.6.1,sip==6.13.1",False,"{""stream"":""\u001b[91m  ERROR: Command errored out with exit status 1:\n   command: /usr/local/bin/python -u -c 'import sys, setuptools, tokenize; sys.argv[0] = '\""'\""'/tmp/pip-install-Dvc0Go/regex/setup.py'\""'\""'; __file__='\""'\""'/tmp/pip-install-Dvc0Go/regex/setup.py'\""'\""';f=getattr(tokenize, '\""'\""'open'\""'\""', open)(__file__);code=f.read().replace('\""'\""'\\r\\n'\""'\""', '\""'\""'\\n'\""'\""');f.close();exec(compile(code, __file__, '\""'\""'exec'\""'\""'))' bdist_wheel -d /tmp/pip-wheel-mG4izn\n      "
-4,005bbad123ef309a5bef,Failed,65.34,"sqlalchemy==1.4.49,redis==3.5.3,requests==2.27.1,python-memcached==1.62",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 6, in <module>
-    import memcache
-  File ""/usr/local/lib/python2.7/site-packages/memcache.py"", line 374
-    def quit_all(self) -> None:
-                       ^
-SyntaxError: invalid syntax
-"
-5,005ceac0483fc5a581cc,ImportError,210.42,"tensorflow==2.1.0,numpy==1.16.6,input_data==0.0.0,image==1.5.27,util==0.0.1",False,"2026-03-04 15:13:38.291655: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libnvinfer.so.6'; dlerror: libnvinfer.so.6: cannot open shared object file: No such file or directory
-2026-03-04 15:13:38.291698: W tensorflow/stream_executor/platform/default/dso_loader.cc:55] Could not load dynamic library 'libnvinfer_plugin.so.6'; dlerror: libnvinfer_plugin.so.6: cannot open shared object file: No such file or directory
-2026-03-04 15:13:38.291701: W tens"
-6,00a17b1d374dfc267a9a,VersionNotFound,8.13,"pymc3==3.11.6,numpy==1.16.6,pandas==0.24.2,theano==0.10.0beta4,scipy==1.2.3",False,"{""stream"":""\u001b[91mERROR: Could not find a version that satisfies the requirement pymc3==3.11.6 (from versions: 3.0rc1, 3.0rc2, 3.0rc4, 3.0rc5, 3.0rc6, 3.0, 3.1rc1, 3.1rc2, 3.1rc3, 3.1, 3.2rc1, 3.2, 3.3rc1, 3.3rc2, 3.3, 3.4rc1, 3.4rc2, 3.4.1, 3.5rc1, 3.5, 3.6, 3.7rc1, 3.7, 3.10.0)\nERROR: No matching distribution found for pymc3==3.11.6\n\u001b[0m""}
-{""error"":""The command 'pip install --trusted-host pypi.python.org --default-timeout=100 pymc3==3.11.6' returned a non-zero code: 1"",""errorDetail"""
-7,00a4835bf36513ca58a3,ImportError,61.42,c4ddev==1.7.2,False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 1, in <module>
-    import c4d
-ImportError: No module named c4d
-"
-8,00e9638c0efad1adac878522cf172484,VersionNotFound,11.64,"gym==0.17.3,keras==3.13.2,tensorflow==2.13.1,numpy==1.24.4",False,"{""stream"":""\u001b[91mERROR: Could not find a version that satisfies the requirement keras==3.13.2 (from versions: 0.2.0, 0.3.0, 0.3.1, 0.3.2, 0.3.3, 1.0.0, 1.0.1, 1.0.2, 1.0.3, 1.0.4, 1.0.5, 1.0.6, 1.0.7, 1.0.8, 1.1.0, 1.1.1, 1.1.2, 1.2.0, 1.2.1, 1.2.2, 2.0.0, 2.0.1, 2.0.2, 2.0.3, 2.0.4, 2.0.5, 2.0.6, 2.0.7, 2.0.8, 2.0.9, 2.1.0, 2.1.1, 2.1.2, 2.1.3, 2.1.4, 2.1.5, 2.1.6, 2.2.0, 2.2.1, 2.2.2, 2.2.3, 2.2.4, 2.2.5, 2.3.0, 2.3.1, 2.4.0, 2.4.1, 2.4.2, 2.4.3, 2.5.0rc0, 2.6.0rc0, 2.6.0rc1, 2.6.0rc2, 2.6"
-9,011004bcac763eaf6f28,ModuleNotFound,56.78,"libxmp==0.0.0,pathpy==2.2.0",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 36, in <module>
-    from libxmp.utils import file_to_dict
-ModuleNotFoundError: No module named 'libxmp'
-"
-10,0115e0ce312f26ff59f4fbf4f5821ca2,ImportError,57.58,rpi==0.0.0,False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 5, in <module>
-    import RPi.GPIO as GPIO
-ImportError: No module named RPi.GPIO
-"
-11,015e2ce27cecdea63564,ImportError,61.88,"pymongo==3.13.0,bson==0.5.10",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 35, in <module>
-    import pymongo
-  File ""/usr/local/lib/python2.7/site-packages/pymongo/__init__.py"", line 114, in <module>
-    from pymongo.collection import ReturnDocument
-  File ""/usr/local/lib/python2.7/site-packages/pymongo/collection.py"", line 20, in <module>
-    from bson.code import Code
-  File ""/usr/local/lib/python2.7/site-packages/bson/code.py"", line 18, in <module>
-    from bson.py3compat import PY3, abc, string_type"
-12,01886b6f79ba0c4dce66,None,55.98,django==4.1.13,False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 3, in <module>
-    from django.contrib.contenttypes.fields import GenericForeignKey
-  File ""/usr/local/lib/python3.8/site-packages/django/contrib/contenttypes/fields.py"", line 7, in <module>
-    from django.contrib.contenttypes.models import ContentType
-  File ""/usr/local/lib/python3.8/site-packages/django/contrib/contenttypes/models.py"", line 137, in <module>
-    class ContentType(models.Model):
-  File ""/usr/local/lib/python3.8/s"
-13,0191e14717af68bbba81,None,53.20,pyspark==3.0.1,False,"INFO  module imported and logger initialized
-JAVA_HOME is not set
-Traceback (most recent call last):
-  File ""/app/snippet.py"", line 43, in <module>
-    sc = pyspark.SparkContext(""local[10]"", 'test')
-  File ""/usr/local/lib/python3.8/site-packages/pyspark/context.py"", line 133, in __init__
-    SparkContext._ensure_initialized(self, gateway=gateway, conf=conf)
-  File ""/usr/local/lib/python3.8/site-packages/pyspark/context.py"", line 325, in _ensure_initialized
-    SparkContext._gateway = gateway or "
-14,019fd5c706e0bc94879f,VersionNotFound,5.98,"rx==3.0.0,twisted==20.3.0",False,"{""stream"":""\u001b[91mERROR: Could not find a version that satisfies the requirement rx==3.0.0 (from versions: 1.0.0, 1.1.0, 1.2.0, 1.2.1, 1.2.3, 1.2.4, 1.2.5, 1.2.6, 1.5.1, 1.5.2, 1.5.3, 1.5.4, 1.5.5, 1.5.6, 1.5.7, 1.5.8, 1.5.9, 1.6.0, 1.6.1, 1.6.3)\nERROR: No matching distribution found for rx==3.0.0\n\u001b[0m""}
-{""error"":""The command 'pip install --trusted-host pypi.python.org --default-timeout=100 rx==3.0.0' returned a non-zero code: 1"",""errorDetail"":{""code"":1,""message"":""The command 'pip ins"
-15,01b8b8e1909ae0f601c85e142f2bd15b,ImportError,62.54,"codecs==0.0.0,pushbullet==0.0.0,weibo==0.2.2,xtls==0.0.0,codecsimport==0.0.0,beautifulsoup==3.2.2",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 9, in <module>
-    from pushbullet import Pushbullet
-ImportError: No module named pushbullet
-"
-16,01bf3900d3a02c4e3927b2a2bcf39100,ImportError,57.05,"opendirectory==0.0.0,systemconfiguration==0.0.0",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 16, in <module>
-    from OpenDirectory import (ODSession, ODNode,
-ImportError: No module named OpenDirectory
-"
-17,01c99322cf985e771827,ModuleNotFound,55.60,"corefoundation==0.0.0,foundation==0.1.0a0.dev1",False,"Traceback (most recent call last):
-  File ""/app/snippet.py"", line 2, in <module>
-    import CoreFoundation
-ModuleNotFoundError: No module named 'CoreFoundation'
-"
-18,026a4d6400b1efac9a13a3296f16e655,ModuleNotFound,55.54,"gensim==4.3.3,tensorflow==2.13.1,word2vec==0.11.1,projector==0.1.1",False,"2026-03-04 15:14:36.208914: I tensorflow/core/util/port.cc:110] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
-2026-03-04 15:14:36.209967: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.
-2026-03-04 15:14:36.229366: I tensorflow/tsl/cuda/cudart_stub.cc:28] C"
-19,02ff378b3a91de94306a84d3aa2228bb,Failed,9.76,azure==5.0.0,False,"{""error"":""The command 'pip install --trusted-host pypi.python.org --default-timeout=100 azure==5.0.0' returned a non-zero code: 1"",""errorDetail"":{""code"":1,""message"":""The command 'pip install --trusted-host pypi.python.org --default-timeout=100 azure==5.0.0' returned a non-zero code: 1""}}
-"
-20,0306734dfe17076dfd34e09660c198c0,VersionNotFound,12.49,"pandas==2.0.3,reos==0.1.0,numpy==1.24.4,shapely==2.0rc3,fiona==1.10b3,geopandas==1.1.2,geojson==3.2.0,shapefile==0.0.0",False,"{""stream"":""\u001b[91m  error: subprocess-exited-with-error\n  \n  × pip subprocess to install backend dependencies did not run successfully.\n  │ exit code: 1\n  ╰─\u003e [2 lines of output]\n      ERROR: Could not find a version that satisfies the requirement puccinialin (from versions: none)\n      ERROR: No matching distribution found for puccinialin\n      [end of output]\n  \n  note: This error originates from a subprocess, and is likely not a problem with pip.\n\u001b[0m""}
-{""error"":""The c"
+00056d4304c58a035c87cdf5ff1e5e3e,00056d4304c58a035c87cdf5ff1e5e3e,success,29.81,"scrapy==2.11.2, peewee==4.0.1",True,
+000eccf3d66540d75def,000eccf3d66540d75def,success,19.81,,True,
+00135b0dfee0ae165ad2,00135b0dfee0ae165ad2,ModuleNotFound,52.08,"maya==0.6.1, sip==6.8.6, pyqt4==0.0.0",False,ModuleNotFound
+005bbad123ef309a5bef,005bbad123ef309a5bef,ImportError,70.01,"redis==3.5.3, python-memcached==1.62, sqlalchemy==1.4.54, requests==0.0.0",False,ImportError
+005ceac0483fc5a581cc,005ceac0483fc5a581cc,VersionNotFound,304.9,"tensorflow==2.1.0, image==1.5.27, util==0.0.1",False,VersionNotFound
+00a17b1d374dfc267a9a,00a17b1d374dfc267a9a,DependencyConflict,50.15,"pymc3==3.11.6, theano==1.0.5, scipy==1.10.1",False,DependencyConflict
+00a4835bf36513ca58a3,00a4835bf36513ca58a3,ModuleNotFound,77.0,c4ddev==1.7.2,False,ModuleNotFound
+00e9638c0efad1adac878522cf172484,00e9638c0efad1adac878522cf172484,VersionNotFound,227.52,"gym==0.17.3, tensorflow==2.13.1",False,VersionNotFound
+011004bcac763eaf6f28,011004bcac763eaf6f28,VersionNotFound,74.36,pathpy==2.2.0,False,VersionNotFound
+0115e0ce312f26ff59f4fbf4f5821ca2,0115e0ce312f26ff59f4fbf4f5821ca2,VersionNotFound,35.31,,False,VersionNotFound

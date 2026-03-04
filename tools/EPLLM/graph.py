@@ -143,16 +143,105 @@ def plan_resolution(state: AgentState) -> dict:
     }
 
 
+def replan(state: AgentState) -> str:
+    """
+    ROUTING based on suggested_strategy from Reflect:
+    • 'swap_version' → go to Resolve Next Module (targeted fix)
+    • 'add_module' → go to Resolve Next Module (with new module added)
+    • 'replan' → go to Plan Resolution (full replanning with new constraints)
+    • iteration >= max_iterations → FAILED
+
+    NOVEL: PLLM never replans — it only retries with different versions.
+    This allows the agent to fundamentally restructure its approach.
+    """
+    iteration = state.get("iteration") or 0
+    max_iterations = state.get("max_iterations") or 10
+    if iteration >= max_iterations:
+        return "__end__"
+    strategy = (state.get("suggested_strategy") or "").strip().lower()
+    if strategy == "replan":
+        return "plan_resolution"
+    if strategy in ("swap_version", "add_module"):
+        return "resolve_next_module"
+    return "resolve_next_module"
+
+
+def resolve_next_module(state: AgentState) -> dict:
+    """
+    RESOLVER AGENT — For the next unresolved module in the plan:
+    1. Read filtered PyPI versions from state (pypi_versions)
+    2. Exclude versions in failed_combos and error_module_versions
+    3. Use OllamaHelper.get_module_versions() for constraint-aware version selection
+    4. Update resolved_modules and current_module
+
+    NOVEL: Instead of PLLM's 'equally distanced sampling', uses
+    constraint-guided selection that respects accumulated knowledge.
+
+    Maps to: OllamaHelper.get_module_versions() (enhanced)
+    Updates: resolved_modules, current_module
+    """
+    resolution_plan = state.get("resolution_plan") or []
+    resolved_modules = dict(state.get("resolved_modules") or {})
+    pypi_versions = state.get("pypi_versions") or {}
+    python_version = state.get("python_version") or "3.10"
+    failed_combos = state.get("failed_combos") or set()
+    error_module_versions = state.get("error_module_versions") or {}
+
+    # 1. Next unresolved module from plan
+    next_module = None
+    for step in resolution_plan:
+        mod = step.get("module") if isinstance(step, dict) else None
+        if mod and mod not in resolved_modules:
+            next_module = mod
+            break
+
+    if not next_module:
+        return {"current_module": None, "resolved_modules": resolved_modules}
+
+    # 2. Candidate versions: exclude failed_combos and error_module_versions
+    all_versions = pypi_versions.get(next_module, [])
+    bad_versions = set(error_module_versions.get(next_module, []))
+    candidate_versions = [
+        v for v in all_versions
+        if (next_module, v) not in failed_combos and v not in bad_versions
+    ]
+    if not candidate_versions:
+        candidate_versions = all_versions
+
+    # 3. Use OllamaHelper.get_module_versions(): write filtered list to temp file, then call
+    with tempfile.TemporaryDirectory() as tmpdir:
+        versions_file = os.path.join(tmpdir, f"{next_module}_{python_version}.txt")
+        with open(versions_file, "w") as f:
+            f.write(", ".join(candidate_versions))
+        ollama = OllamaHelper(model="gemma2", base_modules=tmpdir)
+        details = {"python_modules": [next_module], "python_version": python_version}
+        try:
+            selected = ollama.get_module_versions(details)
+        except Exception:
+            selected = {next_module: candidate_versions[-1]} if candidate_versions else {next_module: "0.0.0"}
+        if next_module in selected:
+            resolved_modules[next_module] = selected[next_module]
+        elif candidate_versions:
+            resolved_modules[next_module] = candidate_versions[-1]
+        else:
+            resolved_modules[next_module] = "0.0.0"
+
+    return {
+        "resolved_modules": resolved_modules,
+        "current_module": next_module,
+    }
 
 def build_graph():
     """Build the LangGraph state graph."""
     builder = StateGraph(AgentState)
     builder.add_node("extract_imports", extract_imports)
     builder.add_node("plan_resolution", plan_resolution)
+    builder.add_node("resolve_next_module", resolve_next_module)
 
     builder.add_edge(START, "extract_imports")
     builder.add_edge("extract_imports", "plan_resolution")
-    builder.add_edge("plan_resolution", END)
+    builder.add_edge("plan_resolution", "resolve_next_module")
+    builder.add_edge("resolve_next_module", END)
 
     return builder.compile()
 

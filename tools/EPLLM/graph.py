@@ -214,11 +214,11 @@ def plan_resolution(state: AgentState) -> dict:
 
 def replan(state: AgentState) -> str:
     """
-    ROUTING based on suggested_strategy from Reflect:
-    • 'swap_version' → go to Resolve Next Module (targeted fix)
-    • 'add_module' → go to Resolve Next Module (with new module added)
-    • 'replan' → go to Plan Resolution (full replanning with new constraints)
-    • iteration >= max_iterations → FAILED
+    ROUTING based on suggested_strategy from Reflect (Replan? diamond):
+    • iteration >= max_iterations → 'limit' → FAILED
+    • 'replan' → Plan Resolution (full replanning with new constraints)
+    • 'swap_version' / 'add_module' → 'fix' → Resolve Next Module (targeted fix)
+    • else → Update Memory → Reflect & Reason → Diagnose Error (loop)
 
     NOVEL: PLLM never replans — it only retries with different versions.
     This allows the agent to fundamentally restructure its approach.
@@ -228,13 +228,16 @@ def replan(state: AgentState) -> str:
     strategy = (state.get("suggested_strategy") or "").strip().lower()
     _log("replan", "iteration=%s/%s strategy=%s", iteration, max_iterations, strategy)
     if iteration >= max_iterations:
-        _log("replan", "-> END (max iterations)")
-        return END
+        _log("replan", "-> failed (limit)")
+        return "limit"
     if strategy == "replan":
-        _log("replan", "-> plan_resolution")
-        return "plan_resolution"
-    _log("replan", "-> resolve_next_module")
-    return "resolve_next_module"
+        _log("replan", "-> plan_resolution (replan)")
+        return "replan"
+    if strategy in ("swap_version", "add_module"):
+        _log("replan", "-> resolve_next_module (fix)")
+        return "fix"
+    _log("replan", "-> update_memory")
+    return "update_memory"
 
 
 def resolve_next_module(state: AgentState) -> dict:
@@ -281,23 +284,34 @@ def resolve_next_module(state: AgentState) -> dict:
         candidate_versions = all_versions
     _log("resolve_next_module", "next_module=%s candidates=%s", next_module, len(candidate_versions))
 
-    # 3. Use OllamaHelper.get_module_versions(): write filtered list to temp file, then call
-    with tempfile.TemporaryDirectory() as tmpdir:
-        versions_file = os.path.join(tmpdir, f"{next_module}_{python_version}.txt")
-        with open(versions_file, "w") as f:
-            f.write(", ".join(candidate_versions))
-        ollama = OllamaHelper(model="gemma2", base_modules=tmpdir)
-        details = {"python_modules": [next_module], "python_version": python_version}
-        try:
-            selected = ollama.get_module_versions(details)
-        except Exception:
-            selected = {next_module: candidate_versions[-1]} if candidate_versions else {next_module: "0.0.0"}
-        if next_module in selected:
-            resolved_modules[next_module] = selected[next_module]
-        elif candidate_versions:
-            resolved_modules[next_module] = candidate_versions[-1]
-        else:
-            resolved_modules[next_module] = "0.0.0"
+    # 3. Pick version: for short lists avoid LLM (PLLM-style); otherwise call LLM but validate result is in candidate list
+    chosen_version = None
+    if candidate_versions and len(candidate_versions) <= 100:
+        # Deterministic: use newest (last in list) to avoid LLM hallucination of non-existent versions
+        chosen_version = candidate_versions[-1].split(" ")[0].split(",")[0]
+    if chosen_version is None and candidate_versions:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            versions_file = os.path.join(tmpdir, f"{next_module}_{python_version}.txt")
+            with open(versions_file, "w") as f:
+                f.write(", ".join(candidate_versions))
+            ollama = OllamaHelper(model="gemma2", base_modules=tmpdir)
+            details = {"python_modules": [next_module], "python_version": python_version}
+            try:
+                selected = ollama.get_module_versions(details)
+            except Exception:
+                selected = {next_module: candidate_versions[-1]} if candidate_versions else {next_module: "0.0.0"}
+            raw = (selected or {}).get(next_module)
+            if raw:
+                ver_str = str(raw).split(" ")[0].split(",")[0].strip()
+                # Only use LLM version if it exists in PyPI list (avoid VersionNotFound from hallucination)
+                if ver_str in candidate_versions or ver_str in all_versions:
+                    chosen_version = ver_str
+            if chosen_version is None and candidate_versions:
+                chosen_version = candidate_versions[-1].split(" ")[0].split(",")[0]
+    if chosen_version:
+        resolved_modules[next_module] = chosen_version
+    else:
+        resolved_modules[next_module] = "0.0.0"
 
     _log("resolve_next_module", "pinned %s=%s", next_module, resolved_modules.get(next_module))
     return {
@@ -307,17 +321,17 @@ def resolve_next_module(state: AgentState) -> dict:
 
 def all_resolved(state: AgentState) -> str:
     """
-    ROUTING: Check if all modules in resolution_plan have a pinned version.
-    If yes → proceed to Build. If no → resolve next module.
+    ROUTING (All Resolved? diamond): Check if all modules in resolution_plan have a pinned version.
+    yes → Docker Build. no → resolve next module (loop).
     """
     resolution_plan = state.get("resolution_plan") or []
     resolved_modules = state.get("resolved_modules") or {}
     planned = {step.get("module") for step in resolution_plan if isinstance(step, dict) and step.get("module")}
     done = planned <= resolved_modules.keys()
-    _log("all_resolved", "planned=%s resolved_keys=%s -> %s", planned, set(resolved_modules.keys()), "docker_build" if done else "resolve_next_module")
+    _log("all_resolved", "planned=%s resolved_keys=%s -> %s", planned, set(resolved_modules.keys()), "yes" if (not planned or done) else "no")
     if not planned or done:
-        return "docker_build"
-    return "resolve_next_module"
+        return "yes"
+    return "no"
 
 
 def docker_build(state: AgentState) -> dict:
@@ -366,10 +380,10 @@ def docker_build(state: AgentState) -> dict:
 
 def build_passed_route(state: AgentState) -> str:
     """
-    ROUTING: Did Docker build succeed without errors?
-    If build_passed → docker_run. Else → diagnose_error (build failure).
+    ROUTING (Build Passed? diamond): Did Docker build succeed without errors?
+    pass → docker_run. fail → diagnose_error (build failure).
     """
-    out = "docker_run" if state.get("build_passed") else "diagnose_error"
+    out = "pass" if state.get("build_passed") else "fail"
     _log("build_passed_route", "build_passed=%s -> %s", state.get("build_passed"), out)
     return out
 
@@ -502,13 +516,13 @@ def docker_run(state: AgentState) -> dict:
     return {"run_log": run_log, "run_passed": run_passed}
 
 
-def run_passed_route(state: AgentState):
+def run_passed_route(state: AgentState) -> str:
     """
-    ROUTING: Did the Python snippet execute without dependency errors?
-    If run_passed → END (success). Else → diagnose_error (run failure).
+    ROUTING (Run Passed? diamond): Did the Python snippet execute without dependency errors?
+    pass → success. fail → diagnose_error (run failure).
     """
-    out = END if state.get("run_passed") else "diagnose_error"
-    _log("run_passed_route", "run_passed=%s -> %s", state.get("run_passed"), "END" if out is END else out)
+    out = "pass" if state.get("run_passed") else "fail"
+    _log("run_passed_route", "run_passed=%s -> %s", state.get("run_passed"), out)
     return out
 
 
@@ -643,23 +657,58 @@ def update_memory(state: AgentState) -> dict:
     }
 
 
+def _failed_terminal(state: AgentState) -> dict:
+    """Terminal node: max iterations reached (FAILED)."""
+    return {}
+
+
+def _success_terminal(state: AgentState) -> dict:
+    """Terminal node: run passed (SUCCESS)."""
+    return {}
+
+
 def build_graph():
-    """Build the LangGraph state graph."""
+    """Build the LangGraph state graph (matches flowchart: Analyze → Plan+Resolve → Build)."""
     builder = StateGraph(AgentState)
+    # Analysis & planning
     builder.add_node("extract_imports", extract_imports)
     builder.add_node("plan_resolution", plan_resolution)
     builder.add_node("resolve_next_module", resolve_next_module)
+    # Build & run
     builder.add_node("docker_build", docker_build)
     builder.add_node("docker_run", docker_run)
+    # Critic loop: diagnose → update_memory → reflect_reason → diagnose
     builder.add_node("diagnose_error", diagnose_error)
+    builder.add_node("update_memory", update_memory)
+    builder.add_node("reflect_reason", reflect_reason)
+    # Terminals (for diagram: FAILED, SUCCESS)
+    builder.add_node("failed", _failed_terminal)
+    builder.add_node("success", _success_terminal)
 
     builder.add_edge(START, "extract_imports")
     builder.add_edge("extract_imports", "plan_resolution")
     builder.add_edge("plan_resolution", "resolve_next_module")
-    builder.add_conditional_edges("resolve_next_module", all_resolved)
-    builder.add_conditional_edges("docker_build", build_passed_route)
-    builder.add_conditional_edges("docker_run", run_passed_route)
-    builder.add_conditional_edges("diagnose_error", replan)
+
+    # All Resolved? → yes: docker_build, no: resolve_next_module
+    builder.add_conditional_edges("resolve_next_module", all_resolved, path_map={"yes": "docker_build", "no": "resolve_next_module"})
+
+    # Build Passed? → pass: docker_run, fail: diagnose_error
+    builder.add_conditional_edges("docker_build", build_passed_route, path_map={"pass": "docker_run", "fail": "diagnose_error"})
+
+    # Run Passed? → pass: success, fail: diagnose_error
+    builder.add_conditional_edges("docker_run", run_passed_route, path_map={"pass": "success", "fail": "diagnose_error"})
+
+    # Replan? → limit: failed, replan: plan_resolution, fix: resolve_next_module, update_memory: update_memory
+    builder.add_conditional_edges(
+        "diagnose_error",
+        replan,
+        path_map={"limit": "failed", "replan": "plan_resolution", "fix": "resolve_next_module", "update_memory": "update_memory"},
+    )
+    builder.add_edge("update_memory", "reflect_reason")
+    builder.add_edge("reflect_reason", "diagnose_error")
+
+    builder.add_edge("failed", END)
+    builder.add_edge("success", END)
 
     return builder.compile()
 

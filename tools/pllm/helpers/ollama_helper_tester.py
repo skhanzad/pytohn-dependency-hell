@@ -2,6 +2,11 @@
 # TESTER FILE FOR PLAYING WITH NEW IDEAS
 import argparse
 import re
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
+print(sys.path)
 
 from helpers.ollama_helper_base import OllamaHelperBase
 from helpers.py_pi_query import PyPIQuery

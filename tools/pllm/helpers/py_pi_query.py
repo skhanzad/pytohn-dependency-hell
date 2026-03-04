@@ -5,6 +5,7 @@ import os
 import re
 from pypi_json import PyPIJSON
 from datetime import datetime
+from pathlib import Path
 
 from helpers.github_cruiser_core import GithubCruiserCore
 from helpers.deps_scraper import DepsScraper
@@ -19,7 +20,7 @@ class PyPIQuery:
         self.logging = False
         self.ghc = GithubCruiserCore(logging=False)
         self.deps = DepsScraper(logging=logging)
-        self.python_versions = self.ghc.load_json_from_file("helpers/ref_files/python_versions.json")
+        self.python_versions = self.ghc.load_json_from_file(Path(__file__).parent / "ref_files" / "python_versions.json")
         os.makedirs(base_modules, exist_ok=True)
         self.base_modules = base_modules
 
@@ -143,7 +144,7 @@ class PyPIQuery:
     # Creates a new array of module names
     def check_module_name(self, module_name):
         # module_name = ['jinja2', 'os', 'json', 'logging', 're', 'hashlib', 'hmac', 'random', 'string', 'time', 'google.appengine.ext', 'google.appengine.api', 'blog_main', 'webapp2', 'google.appengine.ext', 'datetime', 'logging', 'json']
-        f = open('./helpers/ref_files/module_link.json')
+        f = open(Path(__file__).parent / 'ref_files/module_link.json')
         known_modules = json.load(f)
         module_list = []
         if type(module_name) == str:

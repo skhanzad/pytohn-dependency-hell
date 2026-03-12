@@ -25,7 +25,7 @@ RUN python -m pip install --upgrade pip && \
 COPY tools/EPLLM/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-COPY tools/EPLLM/ /EPLLM/
+COPY tools/EPLLM/ /EPLLM/EPLLM/
 COPY hard-gists/ /EPLLM/hard-gists/
 RUN chown -R $UID:$GID /EPLLM
 

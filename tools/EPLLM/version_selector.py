@@ -1,163 +1,192 @@
+"""Multi-strategy version selection for dependency resolution.
+
+Implements deterministic version selection strategies that replace
+PLLM's LLM-based version picking. Strategies include:
+- Latest version (most common default)
+- Binary search (newer/older halves)
+- Error-message-guided selection
+- Dependency-conflict-aware selection
+"""
 import re
-from typing import List, Optional, Dict
 
 
-# Known compatible version combinations for common package groups.
-# When one module is resolved, try to use compatible versions for related modules.
-COMPAT_GROUPS = {
-    "tensorflow": {
-        "tensorflow": {
-            "2.1.0": {"numpy": "1.18.5"},
-            "2.4.0": {"numpy": "1.19.5"},
-            "2.10.0": {"numpy": "1.23.5"},
-            "2.13.1": {"numpy": "1.24.3"},
-            "1.15.0": {"numpy": "1.16.6"},
-        },
-    },
-    "pymc3": {
-        "pymc3": {
-            "3.11.5": {"theano-pymc": "1.1.2", "scipy": "1.7.3", "numpy": "1.21.6"},
-            "3.11.2": {"theano-pymc": "1.1.2", "scipy": "1.7.3"},
-            "3.9.3": {"theano-pymc": "1.0.11", "scipy": "1.5.4"},
-        },
-    },
-    "django": {
-        "django": {
-            "1.11.29": {"djangorestframework": "3.9.4"},
-            "2.2.28": {"djangorestframework": "3.12.4"},
-            "3.2.25": {"djangorestframework": "3.14.0"},
-        },
-    },
-}
+def select_version(versions, strategy='latest', excluded=None, error_info=None):
+    """Select a version from the available versions list.
 
-# Modules that should be replaced with a different pip package name
-# when the original fails (beyond what module_link.json covers).
-FALLBACK_PACKAGES = {
-    "theano": "theano-pymc",
-    "image": "Pillow",
-    "path": "path",  # not pathpy
-}
+    Args:
+        versions: List of version strings sorted oldest to newest.
+        strategy: One of 'latest', 'binary_newer', 'binary_older',
+                  'from_error', 'quartile_newer', 'quartile_older',
+                  'middle', 'oldest_stable'.
+        excluded: Set of version strings to exclude.
+        error_info: ErrorInfo object for error-guided selection.
 
-
-class VersionSelector:
-    """Deterministic version selection with compatibility awareness."""
-
-    @staticmethod
-    def _version_key(version: str):
-        """Sort key for version strings like '1.2.3', '1.0.0rc1'."""
-        return [int(p) if p.isdigit() else p for p in re.split(r'(\d+)', version)]
-
-    @staticmethod
-    def _sort_versions(versions: List[str]) -> List[str]:
-        """Sort versions from oldest to newest."""
-        try:
-            return sorted(versions, key=VersionSelector._version_key)
-        except Exception:
-            return versions
-
-    @classmethod
-    def pick_latest(cls, versions: List[str], exclude: List[str]) -> Optional[str]:
-        """Pick the newest non-excluded version."""
-        sorted_v = cls._sort_versions(versions)
-        exclude_set = set(exclude)
-        for v in reversed(sorted_v):
-            if v not in exclude_set and v != "0.0.0":
-                return v
+    Returns:
+        A version string, or None if no suitable version found.
+    """
+    if not versions:
         return None
 
-    @classmethod
-    def pick_by_binary_search(cls, versions: List[str], exclude: List[str],
-                              prefer_newer: bool = True) -> Optional[str]:
-        """Binary search the version space, picking midpoint of remaining candidates."""
-        sorted_v = cls._sort_versions(versions)
-        exclude_set = set(exclude)
-        candidates = [v for v in sorted_v if v not in exclude_set and v != "0.0.0"]
-        if not candidates:
-            return None
-        if prefer_newer:
-            # Pick from upper half midpoint
-            mid = (len(candidates) + len(candidates) - 1) // 2
-        else:
-            # Pick from lower half midpoint
-            mid = len(candidates) // 4
-        mid = max(0, min(mid, len(candidates) - 1))
-        return candidates[mid]
+    excluded = excluded or set()
+    available = [v for v in versions if v not in excluded]
 
-    @classmethod
-    def pick_from_error_versions(cls, available: List[str],
-                                 exclude: List[str]) -> Optional[str]:
-        """Pick from versions listed in a Docker error message."""
-        if not available:
-            return None
-        return cls.pick_latest(available, exclude)
-
-    @classmethod
-    def pick_compatible(cls, module: str, resolved_modules: Dict[str, str],
-                        versions: List[str], exclude: List[str]) -> Optional[str]:
-        """Pick a version that's known to be compatible with other resolved modules."""
-        for group_name, group_data in COMPAT_GROUPS.items():
-            if module in group_data:
-                mod_compat = group_data[module]
-                # Try each known-good version for this module
-                for compat_ver, deps in sorted(mod_compat.items(),
-                                                key=lambda x: cls._version_key(x[0]),
-                                                reverse=True):
-                    if compat_ver in exclude:
-                        continue
-                    # Check if this version is in available versions
-                    if versions and compat_ver not in versions:
-                        continue
-                    return compat_ver
-            # Also check if this module appears as a dependency in a compat group
-            for anchor_mod, anchor_data in group_data.items():
-                if anchor_mod in resolved_modules:
-                    anchor_ver = resolved_modules[anchor_mod]
-                    if anchor_ver in anchor_data:
-                        suggested_ver = anchor_data[anchor_ver].get(module)
-                        if suggested_ver and suggested_ver not in exclude:
-                            if not versions or suggested_ver in versions:
-                                return suggested_ver
+    if not available:
         return None
 
-    @classmethod
-    def get_fallback_package(cls, module: str) -> Optional[str]:
-        """Return an alternative pip package name for a module that keeps failing."""
-        return FALLBACK_PACKAGES.get(module)
+    # Filter out pre-release versions for initial attempts
+    stable = [v for v in available if _is_stable(v)]
+    pool = stable if stable else available
 
-    @classmethod
-    def select(cls, module: str, versions: List[str],
-               failed: List[str], iteration: int,
-               available_from_error: Optional[List[str]] = None,
-               resolved_modules: Optional[Dict[str, str]] = None) -> Optional[str]:
-        """Main version selection entry point. Escalates strategy by iteration.
+    if not pool:
+        return None
 
-        Strategy escalation:
-        - iteration 0-1: try compatible version first, then pick latest
-        - iteration 2: pick from error versions if available, else binary search (newer)
-        - iteration 3-4: binary search (older)
-        - iteration 5+: try LLM-suggested versions (handled by resolver)
-        """
-        if not versions and not available_from_error:
-            return None
+    if strategy == 'latest':
+        return pool[-1]
 
-        # Always try compatibility-aware selection first
-        if resolved_modules:
-            compat = cls.pick_compatible(module, resolved_modules, versions, failed)
-            if compat:
-                return compat
+    elif strategy == 'binary_newer':
+        # Pick from the newer 75th percentile
+        idx = len(pool) * 3 // 4
+        return pool[min(idx, len(pool) - 1)]
 
-        # If we have versions from the error message, prefer those
-        if available_from_error and iteration >= 2:
-            pick = cls.pick_from_error_versions(available_from_error, failed)
-            if pick:
-                return pick
+    elif strategy == 'binary_older':
+        # Pick from the older 25th percentile
+        idx = len(pool) // 4
+        return pool[idx]
 
-        if not versions:
-            versions = available_from_error or []
+    elif strategy == 'middle':
+        # Pick the middle version
+        return pool[len(pool) // 2]
 
-        if iteration <= 1:
-            return cls.pick_latest(versions, failed)
-        elif iteration == 2:
-            return cls.pick_by_binary_search(versions, failed, prefer_newer=True)
-        else:
-            return cls.pick_by_binary_search(versions, failed, prefer_newer=False)
+    elif strategy == 'quartile_newer':
+        # Pick from the 87.5th percentile
+        idx = len(pool) * 7 // 8
+        return pool[min(idx, len(pool) - 1)]
+
+    elif strategy == 'quartile_older':
+        # Pick from the 12.5th percentile
+        idx = len(pool) // 8
+        return pool[idx]
+
+    elif strategy == 'oldest_stable':
+        return pool[0]
+
+    elif strategy == 'from_error':
+        return _select_from_error(pool, error_info, excluded)
+
+    return pool[-1]  # fallback to latest
+
+
+def get_strategy_for_iteration(iteration, error_info=None):
+    """Determine the version selection strategy based on iteration number.
+
+    Iteration 0: Try latest version (most likely to work)
+    Iteration 1: If error has available versions, use those; else binary newer
+    Iteration 2: Binary older (try older, more battle-tested versions)
+    Iteration 3: Middle version
+    Iteration 4: Quartile older
+    Iteration 5: Quartile newer
+    Iteration 6+: Oldest stable
+    """
+    if error_info and error_info.available_versions:
+        return 'from_error'
+
+    strategies = [
+        'latest',           # 0: start with latest
+        'binary_newer',     # 1: try newer side
+        'binary_older',     # 2: try older side
+        'middle',           # 3: try middle ground
+        'quartile_older',   # 4: try pretty old
+        'quartile_newer',   # 5: try pretty new
+        'oldest_stable',    # 6: try oldest
+    ]
+
+    if iteration < len(strategies):
+        return strategies[iteration]
+    return 'oldest_stable'
+
+
+def select_version_for_iteration(versions, iteration, excluded=None, error_info=None):
+    """Convenience: select version using iteration-based strategy."""
+    strategy = get_strategy_for_iteration(iteration, error_info)
+    return select_version(versions, strategy, excluded, error_info)
+
+
+def _is_stable(version_str):
+    """Check if a version string represents a stable release."""
+    # Pre-release indicators: alpha, beta, rc, dev, pre
+    return not re.search(r'(a|b|rc|dev|pre|alpha|beta)\d*$', version_str, re.IGNORECASE)
+
+
+def _select_from_error(pool, error_info, excluded):
+    """Select a version from the error message's available versions list.
+
+    When pip reports "from versions: v1, v2, v3...", we pick from those
+    versions using a distributed sampling strategy.
+    """
+    if not error_info or not error_info.available_versions:
+        return pool[-1] if pool else None
+
+    # Find versions that are both in the error's list and our pool
+    error_versions = set(error_info.available_versions)
+    candidates = [v for v in pool if v in error_versions]
+
+    if not candidates:
+        # If no overlap, use the error versions directly (filtered by excluded)
+        candidates = [v for v in error_info.available_versions
+                      if v not in excluded and _is_stable(v)]
+
+    if not candidates:
+        candidates = [v for v in error_info.available_versions
+                      if v not in excluded]
+
+    if not candidates:
+        return pool[-1] if pool else None
+
+    # Pick from the newer end of available versions
+    return candidates[-1]
+
+
+def pick_alternative_version(versions, current_version, excluded=None, prefer_older=False):
+    """Pick an alternative version when the current one fails.
+
+    Tries to find a version that's significantly different from the current one.
+    """
+    if not versions:
+        return None
+
+    excluded = set(excluded or [])
+    excluded.add(current_version)
+    available = [v for v in versions if v not in excluded]
+
+    if not available:
+        return None
+
+    # Find current version's position
+    try:
+        current_idx = versions.index(current_version)
+    except ValueError:
+        current_idx = len(versions) - 1
+
+    if prefer_older:
+        # Try versions significantly older
+        target_idx = max(0, current_idx - max(1, len(versions) // 4))
+        # Find nearest available
+        for i in range(target_idx, -1, -1):
+            if versions[i] in available:
+                return versions[i]
+        # Nothing older, try newer
+        for i in range(current_idx + 1, len(versions)):
+            if versions[i] in available:
+                return versions[i]
+    else:
+        # Try versions significantly newer
+        target_idx = min(len(versions) - 1, current_idx + max(1, len(versions) // 4))
+        for i in range(target_idx, len(versions)):
+            if versions[i] in available:
+                return versions[i]
+        # Nothing newer, try older
+        for i in range(current_idx - 1, -1, -1):
+            if versions[i] in available:
+                return versions[i]
+
+    return available[-1] if available else None

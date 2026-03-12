@@ -1,0 +1,13 @@
+# EPLLM Hybrid Resolver - Dependencies
+
+docker>=5.0.0           # Docker API for building/running containers
+requests>=2.25.0        # PyPI API queries
+pyyaml>=5.0             # YAML output logging
+
+# LangGraph LLM fallback (used when deterministic strategies are exhausted)
+langgraph>=0.2.0        # State graph for retry-aware LLM workflows
+langchain-core>=0.2.0   # Prompts, output parsers, base abstractions
+langchain-ollama>=0.1.0 # ChatOllama for local LLM inference
+langchain-openai>=0.1.0 # ChatOpenAI for GPT models (optional)
+pydantic>=2.0           # Structured output schemas
+python-dotenv>=0.19.0   # .env file support for API keys

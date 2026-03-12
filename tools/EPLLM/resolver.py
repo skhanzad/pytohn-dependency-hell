@@ -1,674 +1,838 @@
-"""Core snippet resolver: deterministic first, LLM-assisted (adaptive RAG) fallback."""
+"""Core resolution pipeline for a single Python snippet.
 
+This is the heart of the EPLLM hybrid approach, combining:
+1. PyEGo's AST-based static analysis for import extraction + Python version detection
+2. PyPI querying with deterministic version selection strategies
+3. PLLM's Docker-based iterative validation loop
+4. Regex-based error parsing with targeted recovery
+5. LLM as strategic fallback for ambiguous errors
+
+Resolution flow:
+  Snippet -> AST parse -> detect Python version -> map imports to packages
+  -> query PyPI versions -> select initial versions -> Docker build/test
+  -> if error: parse error + apply fix -> iterate
+  -> if Python version error: try next version
+"""
 import os
-import sys
-import re
 import time
-from pathlib import Path
-from typing import Optional
 
-# Add pllm helpers to path
-_PLLM_DIR = Path(__file__).resolve().parent.parent / "pllm"
-sys.path.insert(0, str(_PLLM_DIR))
-
-from helpers.ollama_helper_tester import OllamaHelper
-from helpers.py_pi_query import PyPIQuery
-from helpers.build_dockerfile import DockerHelper
-from helpers.deps_scraper import DepsScraper
-
-from tools.EPLLM.state import SnippetState
-from tools.EPLLM.error_parser import ErrorParser
-from tools.EPLLM.version_selector import VersionSelector, FALLBACK_PACKAGES
+from EPLLM.state import ResolveResult  # noqa: E402
+from EPLLM.memory import SuccessfulVersionMemory  # noqa: E402
+from EPLLM.import_analyzer import (  # noqa: E402
+    analyze_imports, detect_python_versions, map_import_to_package, is_stdlib
+)
+from EPLLM.pypi_client import PyPIClient  # noqa: E402
+from EPLLM.version_selector import (  # noqa: E402
+    select_version, pick_alternative_version, get_strategy_for_iteration
+)
+from EPLLM.error_parser import parse_error, is_python_version_error  # noqa: E402
 
 
 class SnippetResolver:
-    """Resolves dependencies for a single Python snippet with adaptive RAG."""
+    """Resolves dependencies for a single Python snippet."""
 
-    def __init__(self, base_url: str = "http://localhost:11434",
-                 model: str = "gemma2", temp: float = 0.2,
-                 max_iterations: int = 8, modules_dir: str = "./modules",
-                 logging: bool = False):
-        self.base_url = base_url
-        self.model_name = model
-        self.temp = temp
+    def __init__(self, base_modules='./modules', max_iterations=7,
+                 llm_base_url="http://localhost:11434", llm_model="phi3:medium",
+                 llm_temp=0.3, use_llm=True, logging=False):
+        self.pypi = PyPIClient(cache_dir=base_modules, logging=logging)
+        self.success_memory = SuccessfulVersionMemory(
+            cache_dir=base_modules, logging=logging
+        )
         self.max_iterations = max_iterations
-        self.modules_dir = modules_dir
         self.logging = logging
+        self.use_llm = bool(use_llm)
+        self.llm = None
 
-        os.makedirs(modules_dir, exist_ok=True)
+        if self.use_llm:
+            try:
+                from EPLLM.llm_client import LLMClient  # noqa: E402
 
-        self.error_parser = ErrorParser()
-        self.pypi = PyPIQuery(logging=logging, base_modules=modules_dir)
-        self.deps = DepsScraper(logging=logging)
-
-        # LLM helper — used for initial analysis AND adaptive RAG error recovery
-        self.llm = OllamaHelper(
-            base_url=base_url, model=model, temp=temp,
-            logging=logging, base_modules=modules_dir, rag=True
-        )
-
-    def resolve(self, file_path: str) -> SnippetState:
-        """Main entry point. Returns final state dict."""
-        split = file_path.split("/")
-        snippet_name = split[-2] if len(split) >= 2 else "unknown"
-
-        state: SnippetState = {
-            "file_path": file_path,
-            "snippet_name": snippet_name,
-            "python_version": "3.8",
-            "imports": [],
-            "resolved_modules": {},
-            "failed_versions": {},
-            "build_passed": False,
-            "run_passed": False,
-            "build_log": "",
-            "run_log": "",
-            "error_type": None,
-            "error_module": None,
-            "iteration": 0,
-            "max_iterations": self.max_iterations,
-            "status": "pending",
-        }
-
-        try:
-            self._analyze(state)
-            self._resolve_versions(state)
-            self._filter_bad_modules(state)
-            self._iteration_loop(state)
-        except Exception as e:
-            if self.logging:
-                print(f"[EPLLM] resolve error for {snippet_name}: {e}")
-            state["status"] = "failed"
-            state["error_type"] = str(e)
-
-        return state
-
-    # --- Phase 1: Analysis (single LLM call) ---
-
-    def _analyze(self, state: SnippetState):
-        """Detect Python version and imports. One LLM call + regex scraping."""
-        file_path = state["file_path"]
-
-        # Read source for heuristic checks
-        try:
-            with open(file_path, "r") as f:
-                source = f.read()
-        except Exception:
-            source = ""
-
-        # Python 2 heuristic before LLM
-        is_py2 = self.error_parser.detect_python2(source)
-
-        # Regex-based import scraping
-        scraped = self.deps.find_word_in_file(file_path, "import", [])
-
-        # Single LLM call
-        llm_eval = self.llm.evaluate_file(file_path)
-
-        if llm_eval:
-            py_ver = str(llm_eval.get("python_version", "3.8"))
-            llm_modules = llm_eval.get("python_modules", [])
-            if isinstance(llm_modules, dict):
-                llm_modules = list(llm_modules.keys())
-        else:
-            py_ver = "3.8"
-            llm_modules = []
-
-        # Override version if heuristic strongly suggests Python 2
-        if is_py2:
-            py_ver = "2.7"
-
-        # Merge LLM modules with scraped imports, deduplicate
-        combined = list(dict.fromkeys(llm_modules + scraped))
-
-        # Clean through PyPI name resolution
-        cleaned = self.pypi.check_module_name(combined)
-
-        state["python_version"] = self.pypi.check_format(py_ver)
-        state["imports"] = cleaned
-
-        if self.logging:
-            print(f"[EPLLM] Analyzed {state['snippet_name']}: "
-                  f"py={state['python_version']}, modules={cleaned}")
-
-    # --- Phase 2: Deterministic version resolution (0 LLM calls) ---
-
-    def _resolve_versions(self, state: SnippetState):
-        """For each module, read cached version file or query PyPI, pick latest."""
-        modules = state["imports"]
-        py_ver = state["python_version"]
-
-        # First, generate version files via PyPI query
-        module_details = {"python_version": py_ver, "python_modules": modules}
-        resolved_modules, py_ver = self.pypi.get_module_specifics(module_details)
-        state["python_version"] = py_ver
-
-        resolved = {}
-        for module in resolved_modules:
-            version_str = self._read_versions_file(module, py_ver)
-            if not version_str or not version_str.strip():
-                # No versions available — skip or use placeholder
-                resolved[module] = "0.0.0"
-                continue
-
-            versions = [v.strip() for v in version_str.split(",") if v.strip()]
-            if versions:
-                # Try compatibility-aware pick first, then latest
-                pick = VersionSelector.select(
-                    module, versions, [], 0,
-                    resolved_modules=resolved
+                self.llm = LLMClient(
+                    base_url=llm_base_url,
+                    model=llm_model,
+                    temperature=llm_temp,
                 )
-                resolved[module] = pick if pick else versions[-1]
-            else:
-                resolved[module] = "0.0.0"
+            except Exception as exc:
+                self.use_llm = False
+                if self.logging:
+                    print(f"  LangGraph fallback disabled: {exc}")
 
-        state["resolved_modules"] = resolved
+    def resolve(self, snippet_path):
+        """Resolve dependencies for a Python snippet.
+
+        Returns a ResolveResult with success/failure, resolved modules,
+        Python version, and metadata.
+        """
+        start_time = time.time()
+        snippet_path = os.path.abspath(snippet_path)
+
+        if not os.path.isfile(snippet_path):
+            return ResolveResult(
+                success=False, error_type='FileNotFound',
+                error_message=f'File not found: {snippet_path}',
+                duration=time.time() - start_time
+            )
+
+        # ── Phase 1: Static Analysis (PyEGo-inspired) ───────────────────
+        if self.logging:
+            print(f"\n{'='*60}")
+            print(f"Resolving: {snippet_path}")
+
+        # Extract imports using AST
+        packages = analyze_imports(snippet_path)
+        if self.logging:
+            print(f"  Detected packages: {packages}")
+
+        # Detect Python version from syntax features
+        python_versions = detect_python_versions(snippet_path)
+        if self.logging:
+            print(f"  Python version candidates: {python_versions}")
+
+        if not packages:
+            # No third-party imports found
+            return ResolveResult(
+                success=True, python_version=python_versions[0],
+                modules={}, iterations=0,
+                duration=time.time() - start_time
+            )
+
+        # ── Phase 2: Try each Python version ────────────────────────────
+        last_result = None
+        total_iterations = 0
+
+        for py_ver in python_versions:
+            result = self._try_python_version(
+                snippet_path, packages, py_ver, start_time
+            )
+            total_iterations += result.iterations
+
+            if result.success:
+                result.iterations = total_iterations
+                return result
+
+            last_result = result
+
+            if self.logging:
+                print(f"  Python {py_ver} failed: {result.error_type}")
+
+        # All versions exhausted - return last attempt's result
+        if last_result:
+            last_result.iterations = total_iterations
+            last_result.duration = time.time() - start_time
+            return last_result
+
+        return ResolveResult(
+            success=False, python_version=python_versions[0],
+            error_type='NoVersions', error_message='All versions exhausted',
+            iterations=total_iterations,
+            duration=time.time() - start_time
+        )
+
+    def _try_python_version(self, snippet_path, packages, python_version, start_time):
+        """Try to resolve dependencies for a specific Python version."""
+        if self.logging:
+            print(f"\n  Trying Python {python_version}...")
+
+        # ── Phase 3: Fetch available versions from PyPI ──────────────────
+        version_cache = {}  # {package: [versions]}
+        valid_packages = []
+
+        for pkg in packages:
+            versions = self.pypi.get_versions(pkg, python_version)
+            if versions:
+                version_cache[pkg] = versions
+                valid_packages.append(pkg)
+            elif self.logging:
+                print(f"    No versions found for {pkg} on Python {python_version}")
+
+        if not valid_packages:
+            return ResolveResult(
+                success=False, python_version=python_version,
+                error_type='NoVersions',
+                error_message='No packages found on PyPI',
+                duration=time.time() - start_time
+            )
+
+        # ── Phase 4: Select initial versions ─────────────────────────────
+        modules = {}  # {package: version}
+        for pkg in valid_packages:
+            ver = self._choose_version(
+                package=pkg,
+                versions=version_cache[pkg],
+                python_version=python_version,
+                iteration=0,
+            )
+            if ver:
+                modules[pkg] = ver
 
         if self.logging:
-            print(f"[EPLLM] Resolved versions: {resolved}")
+            print(f"    Initial versions: {modules}")
 
-    def _filter_bad_modules(self, state: SnippetState):
-        """Remove modules that can't be pip-installed before even trying."""
-        to_remove = []
-        for module, version in state["resolved_modules"].items():
-            # Skip system / non-pip packages
-            if self.error_parser.is_system_package(module):
-                to_remove.append(module)
-                continue
-            # Skip modules with 0.0.0 placeholder — they aren't real pip packages
-            if version == "0.0.0":
-                # Check if there's a fallback package name
-                fallback = VersionSelector.get_fallback_package(module)
-                if fallback and fallback != module:
-                    # Try the fallback package
-                    versions = self._get_version_list(fallback, state["python_version"])
-                    if not versions:
-                        self.pypi.read_module_file(fallback, state["python_version"])
-                        versions = self._get_version_list(fallback, state["python_version"])
-                    if versions:
-                        pick = VersionSelector.pick_latest(versions, [])
-                        if pick:
-                            state["resolved_modules"][fallback] = pick
-                to_remove.append(module)
+        # ── Phase 5: Iterative Docker validation ─────────────────────────
+        failed_versions = {}  # {package: set(failed_versions)}
+        from EPLLM.docker_tester import DockerTester  # noqa: E402
+        docker = DockerTester(logging=self.logging)
 
-        for module in to_remove:
-            if module in state["resolved_modules"]:
-                del state["resolved_modules"][module]
-                if self.logging:
-                    print(f"[EPLLM] Filtered out non-pip module: {module}")
-
-    def _read_versions_file(self, module: str, py_ver: str) -> str:
-        """Read module versions from cache file."""
-        fpath = f"{self.modules_dir}/{module}_{py_ver}.txt"
-        if os.path.isfile(fpath):
-            with open(fpath, "r") as f:
-                return f.read()
-        return ""
-
-    def _get_version_list(self, module: str, py_ver: str) -> list:
-        """Get sorted list of versions for a module."""
-        content = self._read_versions_file(module, py_ver)
-        if not content or not content.strip():
-            # Try to generate it
-            content = self.pypi.read_module_file(module, py_ver)
-        if not content or not content.strip():
-            return []
-        return [v.strip() for v in content.split(",") if v.strip()]
-
-    # --- Phase 3: Build/run iteration loop with adaptive RAG ---
-
-    def _iteration_loop(self, state: SnippetState):
-        """Loop: build → handle error → run → handle error, up to max_iterations.
-        Uses deterministic handling first, then LLM-assisted (adaptive RAG) fallback."""
-        docker = DockerHelper(logging=self.logging)
-        state["status"] = "building"
-
-        consecutive_deterministic_failures = 0
-
-        for i in range(state["max_iterations"]):
-            state["iteration"] = i
-
-            # Build
-            build_ok = self._docker_build(state, docker)
-            if not build_ok:
-                # Try deterministic first
-                handled = self._handle_error(state, state["build_log"], docker)
-                if not handled:
-                    consecutive_deterministic_failures += 1
-                    # Adaptive RAG: use LLM when deterministic fails
-                    if consecutive_deterministic_failures >= 1:
-                        handled = self._llm_error_recovery(state, state["build_log"])
-                    if not handled:
-                        state["status"] = "failed"
-                        self._cleanup(docker)
-                        return
-                else:
-                    consecutive_deterministic_failures = 0
-                continue
-
-            # Run
-            state["build_passed"] = True
-            consecutive_deterministic_failures = 0
-            run_ok = self._docker_run(state, docker)
-            if run_ok:
-                state["run_passed"] = True
-                state["status"] = "success"
-                self._cleanup(docker)
-                return
-            else:
-                # Handle run error
-                handled = self._handle_error(state, state["run_log"], docker)
-                if not handled:
-                    # Adaptive RAG fallback for run errors too
-                    handled = self._llm_error_recovery(state, state["run_log"])
-                    if not handled:
-                        state["status"] = "failed"
-                        self._cleanup(docker)
-                        return
-
-        state["status"] = "failed"
-        self._cleanup(docker)
-
-    def _docker_build(self, state: SnippetState, docker: DockerHelper) -> bool:
-        """Create Dockerfile and build. Returns True if build succeeds."""
-        llm_out = {
-            "python_version": state["python_version"],
-            "python_modules": state["resolved_modules"],
-        }
-        docker.create_dockerfile(llm_out, state["file_path"])
-        passed, error_log = docker.build_dockerfile(state["file_path"])
-        state["build_log"] = error_log
-        state["build_passed"] = passed
-        if self.logging and not passed:
-            print(f"[EPLLM] Build failed (iter {state['iteration']}): "
-                  f"{error_log[:200]}")
-        return passed
-
-    def _docker_run(self, state: SnippetState, docker: DockerHelper) -> bool:
-        """Run the container and check output."""
         try:
-            output = docker.run_container_test()
-        except Exception as e:
-            output = str(e)
-
-        state["run_log"] = output
-
-        # Check for errors in run output
-        error_type, _, _ = self.error_parser.parse_error(output)
-        if error_type == "None":
-            return True
-        return False
-
-    # --- Deterministic error handling ---
-
-    def _handle_error(self, state: SnippetState, log: str,
-                      docker: DockerHelper) -> bool:
-        """Deterministic error handling. Returns True if state was updated and we should retry."""
-        error_type, module, version = self.error_parser.parse_error(log)
-        state["error_type"] = error_type
-        state["error_module"] = module
-
-        if error_type == "None":
-            return False
-
-        py_ver = state["python_version"]
-        resolved = state["resolved_modules"]
-        failed = state["failed_versions"]
-
-        # Record failed version
-        if module and version:
-            failed.setdefault(module, [])
-            if version not in failed[module]:
-                failed[module].append(version)
-
-        # Also record current resolved version as failed
-        if module and module in resolved:
-            cur_ver = resolved[module]
-            failed.setdefault(module, [])
-            if cur_ver not in failed[module]:
-                failed[module].append(cur_ver)
-
-        # Module failed too many times — try fallback package or remove
-        if module and len(failed.get(module, [])) >= 4:
-            # Try fallback package name first
-            fallback = VersionSelector.get_fallback_package(module)
-            if fallback and fallback != module and fallback not in resolved:
-                versions = self._get_version_list(fallback, py_ver)
-                if not versions:
-                    self.pypi.read_module_file(fallback, py_ver)
-                    versions = self._get_version_list(fallback, py_ver)
-                if versions:
-                    pick = VersionSelector.pick_latest(versions, [])
-                    if pick:
-                        del resolved[module]
-                        resolved[fallback] = pick
-                        if self.logging:
-                            print(f"[EPLLM] Swapped {module} -> {fallback}=={pick}")
-                        return True
-
-            if module in resolved:
+            for iteration in range(self.max_iterations):
                 if self.logging:
-                    print(f"[EPLLM] Removing {module} after {len(failed[module])} failures")
-                del resolved[module]
-                return True
+                    print(f"\n    Iteration {iteration + 1}/{self.max_iterations}")
+                    print(f"    Modules: {modules}")
 
-        if error_type == "VersionNotFound":
-            return self._handle_version_not_found(state, log, module)
+                # Build Dockerfile and Docker image
+                docker.create_dockerfile(snippet_path, python_version, modules)
+                build_ok, build_output = docker.build(snippet_path)
 
-        elif error_type in ("ModuleNotFound", "ImportError"):
-            return self._handle_missing_module(state, module)
+                if build_ok:
+                    # Build succeeded - run the container
+                    run_ok, run_output = docker.run(timeout=60)
 
-        elif error_type == "SyntaxError":
-            return self._handle_syntax_error(state, log)
+                    if run_ok:
+                        # SUCCESS!
+                        if self.logging:
+                            print(f"    SUCCESS on iteration {iteration + 1}")
+                        self.success_memory.remember_resolution(
+                            python_version, modules
+                        )
+                        self._log_result(snippet_path, python_version, modules,
+                                         'NoError', '', iteration + 1, start_time, True)
+                        return ResolveResult(
+                            success=True, python_version=python_version,
+                            modules=dict(modules), iterations=iteration + 1,
+                            duration=time.time() - start_time
+                        )
 
-        elif error_type == "NonZeroCode":
-            return self._handle_non_zero(state, module)
+                    # Runtime error - parse and fix
+                    error = parse_error(run_output)
+                    if self.logging:
+                        print(f"    Runtime error: {error}")
+                else:
+                    # Build error - parse and fix
+                    error = parse_error(build_output)
+                    if self.logging:
+                        print(f"    Build error: {error}")
 
-        elif error_type == "AttributeError":
-            return self._handle_attribute_error(state, module)
+                # ── Phase 6: Error Recovery ──────────────────────────────
+                if is_python_version_error(error):
+                    # Need different Python version
+                    self._log_result(snippet_path, python_version, modules,
+                                     error.error_type, error.message,
+                                     iteration + 1, start_time, False)
+                    return ResolveResult(
+                        success=False, python_version=python_version,
+                        modules=dict(modules), error_type=error.error_type,
+                        error_message='Python version mismatch',
+                        iterations=iteration + 1,
+                        duration=time.time() - start_time
+                    )
 
-        elif error_type == "DependencyConflict":
-            return self._handle_dependency_conflict(state, module)
+                fixed = self._apply_fix(
+                    error, modules, version_cache, failed_versions,
+                    python_version, iteration
+                )
 
-        elif error_type == "InvalidVersion":
-            return self._handle_invalid_version(state, module)
+                if not fixed:
+                    if self.logging:
+                        print(f"    No fix available, stopping")
+                    self._log_result(snippet_path, python_version, modules,
+                                     error.error_type, error.message,
+                                     iteration + 1, start_time, False)
+                    break
+
+                self._log_result(snippet_path, python_version, modules,
+                                 error.error_type, error.message,
+                                 iteration + 1, start_time, False)
+
+        finally:
+            docker.cleanup()
+
+        return ResolveResult(
+            success=False, python_version=python_version,
+            modules=dict(modules), error_type=error.error_type if 'error' in dir() else 'MaxIterations',
+            error_message=error.message if 'error' in dir() else 'Max iterations reached',
+            iterations=min(iteration + 1, self.max_iterations) if 'iteration' in dir() else 0,
+            duration=time.time() - start_time
+        )
+
+    def _apply_fix(self, error, modules, version_cache, failed_versions,
+                   python_version, iteration):
+        """Apply a targeted fix based on the error type.
+
+        Returns True if a fix was applied, False if no fix is possible.
+        """
+        etype = error.error_type
+
+        if etype == 'VersionNotFound':
+            return self._fix_version_not_found(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'DependencyConflict':
+            return self._fix_dependency_conflict(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'ModuleNotFound':
+            return self._fix_module_not_found(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'ImportError':
+            return self._fix_import_error(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'AttributeError':
+            return self._fix_attribute_error(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'NonZeroCode':
+            return self._fix_non_zero_code(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'SyntaxError':
+            return self._fix_syntax_error(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype == 'InvalidVersion':
+            return self._fix_invalid_version(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
+
+        elif etype in ('NameError', 'TypeError'):
+            # These are usually code issues, not dependency issues
+            # But sometimes a different module version helps
+            return self._fix_generic_version(
+                error, modules, version_cache, failed_versions, python_version, iteration
+            )
 
         return False
 
-    def _handle_version_not_found(self, state: SnippetState, log: str,
-                                  module: Optional[str]) -> bool:
-        """Parse available versions from error, pick next via VersionSelector."""
+    def _get_package_versions(self, package, python_version, version_cache):
+        """Get versions from local cache or PyPI."""
+        versions = version_cache.get(package, [])
+        if versions:
+            return versions
+
+        versions = self.pypi.get_versions(package, python_version)
+        if versions:
+            version_cache[package] = versions
+        return versions
+
+    def _choose_version(self, package, versions, python_version, iteration=0,
+                        excluded=None, error=None, current_version=None,
+                        prefer_older=False, allow_llm=True):
+        """Choose a version using success memory, determinism, then LLM."""
+        versions = list(versions or [])
+        excluded = set(excluded or [])
+
+        if not versions:
+            return None
+
+        remembered = self.success_memory.get_preferred_version(
+            package=package,
+            python_version=python_version,
+            available_versions=versions,
+            excluded=excluded,
+            current_version=current_version,
+            prefer_older=prefer_older,
+        )
+        if remembered:
+            if self.logging:
+                print(f"    Using remembered version for {package}: {remembered}")
+            return remembered
+
+        if current_version:
+            candidate = pick_alternative_version(
+                versions,
+                current_version,
+                excluded,
+                prefer_older=prefer_older,
+            )
+        else:
+            candidate = select_version(
+                versions,
+                get_strategy_for_iteration(iteration, error),
+                excluded,
+                error,
+            )
+
+        if candidate:
+            if self.logging:
+                print(f"    Using deterministic version for {package}: {candidate}")
+            return candidate
+
+        if allow_llm and self.use_llm and self.llm:
+            llm_version = self.llm.suggest_version(
+                package,
+                ', '.join(versions),
+                python_version,
+                excluded_versions=', '.join(sorted(excluded)),
+                error_context=error.message if error else '',
+            )
+            valid_llm_versions = set(versions)
+            if error and error.available_versions:
+                valid_llm_versions.update(error.available_versions)
+            if llm_version and llm_version not in excluded and llm_version in valid_llm_versions:
+                if self.logging:
+                    print(f"    Using LangGraph fallback for {package}: {llm_version}")
+                return llm_version
+
+        return None
+
+    # ── Fix implementations ──────────────────────────────────────────────
+
+    def _fix_version_not_found(self, error, modules, version_cache,
+                               failed_versions, python_version, iteration):
+        """Fix: pick a different version from the available list."""
+        module = error.module
         if not module:
             return False
 
-        available = self.error_parser.extract_available_versions(log)
-        failed_list = state["failed_versions"].get(module, [])
+        # Track failed version
+        if module in modules:
+            failed_versions.setdefault(module, set()).add(modules[module])
 
-        # Also try cached versions
-        cached = self._get_version_list(module, state["python_version"])
-        all_versions = available if available else cached
+        # If error contains available versions, use those (pip's version list
+        # is filtered to the current Python version - much more accurate)
+        if error.available_versions:
+            version_cache[module] = error.available_versions
+            # Also update disk cache with the Python-version-specific list
+            try:
+                cache_path = self.pypi._cache_path(module, python_version)
+                with open(cache_path, 'w') as f:
+                    f.write(', '.join(error.available_versions))
+            except (IOError, OSError):
+                pass
 
-        pick = VersionSelector.select(
-            module, all_versions, failed_list,
-            state["iteration"], available,
-            resolved_modules=state["resolved_modules"]
-        )
-
-        if pick:
-            state["resolved_modules"][module] = pick
-            if self.logging:
-                print(f"[EPLLM] VersionNotFound: {module} -> {pick}")
-            return True
-
-        # No version found — remove the module
-        if module in state["resolved_modules"]:
-            del state["resolved_modules"][module]
-            return True
-
-        return False
-
-    def _handle_missing_module(self, state: SnippetState,
-                               module: Optional[str]) -> bool:
-        """Add missing module, query PyPI, pick latest."""
-        if not module:
-            return False
-
-        # Resolve canonical name
-        canonical = self.pypi.check_module_name(module)
-        mod_name = canonical[0] if canonical else module
-
-        # Skip system packages
-        if self.error_parser.is_system_package(mod_name):
-            if self.logging:
-                print(f"[EPLLM] Skipping system package: {mod_name}")
-            return True
-
-        # Query versions and pick latest
-        versions = self._get_version_list(mod_name, state["python_version"])
-        if not versions:
-            # Try to generate
-            self.pypi.read_module_file(mod_name, state["python_version"])
-            versions = self._get_version_list(mod_name, state["python_version"])
+        versions = self._get_package_versions(module, python_version, version_cache)
 
         if not versions:
-            # Module isn't on PyPI — skip it
-            if self.logging:
-                print(f"[EPLLM] No PyPI versions for {mod_name}, skipping")
+            # Remove the package entirely
+            modules.pop(module, None)
             return True
 
-        failed_list = state["failed_versions"].get(mod_name, [])
-        pick = VersionSelector.select(
-            mod_name, versions, failed_list, state["iteration"],
-            resolved_modules=state["resolved_modules"]
+        excluded = failed_versions.get(module, set())
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
         )
 
-        if pick and pick != "0.0.0":
-            state["resolved_modules"][mod_name] = pick
-            if self.logging:
-                print(f"[EPLLM] Added missing module: {mod_name}=={pick}")
+        if new_ver:
+            modules[module] = new_ver
+            return True
+
+        # Remove the package
+        modules.pop(module, None)
         return True
 
-    def _handle_syntax_error(self, state: SnippetState, log: str) -> bool:
-        """If syntax error looks like Python 2 issue, switch to 2.7."""
-        if state["python_version"] != "2.7":
-            if self.logging:
-                print("[EPLLM] SyntaxError: switching to Python 2.7")
-            state["python_version"] = "2.7"
-            # Re-resolve all module versions for Python 2.7
-            self._resolve_versions(state)
-            self._filter_bad_modules(state)
+    def _fix_dependency_conflict(self, error, modules, version_cache,
+                                 failed_versions, python_version, iteration):
+        """Fix: adjust the conflicting package's version."""
+        module = error.module
+        if not module:
+            # Try to find the conflicting module in the error message
+            # If we can't, try adjusting all modules
+            for pkg in list(modules.keys()):
+                if pkg in error.message:
+                    module = pkg
+                    break
+
+        if not module:
+            # Can't identify the conflicting module
+            # Try downgrading the most recently added package
+            if modules:
+                module = list(modules.keys())[-1]
+            else:
+                return False
+
+        # Track failed version
+        if module in modules:
+            failed_versions.setdefault(module, set()).add(modules[module])
+
+        versions = self._get_package_versions(module, python_version, version_cache)
+        excluded = failed_versions.get(module, set())
+
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules.get(module, ''),
+            prefer_older=True,
+        )
+
+        if new_ver:
+            modules[module] = new_ver
             return True
 
-        # Already on 2.7 — try to identify the module from the error
-        mod_match = re.search(r"site-packages/(\w+)", log)
-        if mod_match:
-            module = mod_match.group(1)
-            failed = state["failed_versions"].get(module, [])
-            versions = self._get_version_list(module, state["python_version"])
-            pick = VersionSelector.select(
-                module, versions, failed, state["iteration"],
-                resolved_modules=state["resolved_modules"]
+        # If the conflicting module was required by another module,
+        # try adjusting the requiring module instead
+        if error.required_by and error.required_by in modules:
+            req_by = error.required_by
+            failed_versions.setdefault(req_by, set()).add(modules[req_by])
+            req_versions = self._get_package_versions(
+                req_by, python_version, version_cache
             )
-            if pick and module in state["resolved_modules"]:
-                state["resolved_modules"][module] = pick
+            req_excluded = failed_versions.get(req_by, set())
+            new_ver = self._choose_version(
+                package=req_by,
+                versions=req_versions,
+                python_version=python_version,
+                iteration=iteration,
+                excluded=req_excluded,
+                error=error,
+                current_version=modules[req_by],
+                prefer_older=True,
+            )
+            if new_ver:
+                modules[req_by] = new_ver
                 return True
 
         return False
 
-    def _handle_non_zero(self, state: SnippetState,
-                         module: Optional[str]) -> bool:
-        """Try removing the failing module or picking a different version."""
+    def _fix_module_not_found(self, error, modules, version_cache,
+                              failed_versions, python_version, iteration):
+        """Fix: add the missing module as a new package."""
+        module = error.module
         if not module:
             return False
 
-        failed_list = state["failed_versions"].get(module, [])
-        versions = self._get_version_list(module, state["python_version"])
+        # Check if this is a stdlib module we shouldn't install
+        if is_stdlib(module):
+            return False
+
+        # Map to package name
+        pkg = map_import_to_package(module)
+        if not pkg:
+            pkg = module.lower()
+
+        # Check if already installed (might be a submodule issue)
+        if pkg in modules:
+            # Try a different version
+            failed_versions.setdefault(pkg, set()).add(modules[pkg])
+            versions = self._get_package_versions(pkg, python_version, version_cache)
+            excluded = failed_versions.get(pkg, set())
+            new_ver = self._choose_version(
+                package=pkg,
+                versions=versions,
+                python_version=python_version,
+                iteration=iteration,
+                excluded=excluded,
+                error=error,
+                current_version=modules[pkg],
+                prefer_older=True,
+            )
+            if new_ver:
+                modules[pkg] = new_ver
+                return True
+            return False
+
+        # Add new package
+        versions = self._get_package_versions(pkg, python_version, version_cache)
+        if not versions:
+            # Try resolving the package name
+            resolved = self.pypi.resolve_package_name(module)
+            if resolved != pkg:
+                versions = self._get_package_versions(
+                    resolved, python_version, version_cache
+                )
+                if versions:
+                    pkg = resolved
 
         if versions:
-            pick = VersionSelector.select(
-                module, versions, failed_list, state["iteration"],
-                resolved_modules=state["resolved_modules"]
+            new_ver = self._choose_version(
+                package=pkg,
+                versions=versions,
+                python_version=python_version,
+                iteration=iteration,
+                error=error,
             )
-            if pick:
-                state["resolved_modules"][module] = pick
+            if new_ver:
+                modules[pkg] = new_ver
                 return True
 
-        # Can't find a working version — remove
-        if module in state["resolved_modules"]:
-            del state["resolved_modules"][module]
-            if self.logging:
-                print(f"[EPLLM] NonZeroCode: removing {module}")
+        return False
+
+    def _fix_import_error(self, error, modules, version_cache,
+                          failed_versions, python_version, iteration):
+        """Fix: try a different version of the module causing ImportError."""
+        module = error.module
+        if not module:
+            return False
+
+        # Map to package name
+        pkg = map_import_to_package(module)
+        if not pkg:
+            pkg = module.lower()
+
+        if pkg not in modules:
+            # Module not installed - add it
+            return self._fix_module_not_found(error, modules, version_cache,
+                                              failed_versions, python_version, iteration)
+
+        # Track failed version
+        failed_versions.setdefault(pkg, set()).add(modules[pkg])
+        versions = self._get_package_versions(pkg, python_version, version_cache)
+        excluded = failed_versions.get(pkg, set())
+
+        new_ver = self._choose_version(
+            package=pkg,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules[pkg],
+            prefer_older=(iteration >= 2),
+        )
+
+        if new_ver:
+            modules[pkg] = new_ver
             return True
 
         return False
 
-    def _handle_attribute_error(self, state: SnippetState,
-                                module: Optional[str]) -> bool:
-        """Try older version of identified module."""
-        if not module:
-            # Try to find the module from the traceback
-            module = self.error_parser.extract_traceback_module(
-                state.get("run_log", "") or state.get("build_log", ""),
-                state["resolved_modules"]
-            )
-            if not module:
-                return False
+    def _fix_attribute_error(self, error, modules, version_cache,
+                             failed_versions, python_version, iteration):
+        """Fix: try a different version of the module with AttributeError."""
+        module = error.module
 
-        # If module isn't in resolved, check if it's a known alias
-        if module not in state["resolved_modules"]:
-            canonical = self.pypi.check_module_name(module)
-            mod_name = canonical[0] if canonical else module
-            # Check if canonical name is in resolved
-            if mod_name in state["resolved_modules"]:
-                module = mod_name
+        # For AttributeError, regex might miss the module - use LLM
+        if not module and self.llm and self.use_llm:
+            module = self.llm.identify_module_from_error(
+                error.message, list(modules.keys())
+            )
+
+        if not module:
+            return False
+
+        pkg = map_import_to_package(module)
+        if not pkg:
+            pkg = module.lower()
+
+        if pkg not in modules:
+            # Try finding in installed modules
+            for installed_pkg in modules:
+                if module.lower() in installed_pkg.lower():
+                    pkg = installed_pkg
+                    break
             else:
                 return False
 
-        failed_list = state["failed_versions"].get(module, [])
-        versions = self._get_version_list(module, state["python_version"])
+        # Track failed version and try older
+        failed_versions.setdefault(pkg, set()).add(modules[pkg])
+        versions = self._get_package_versions(pkg, python_version, version_cache)
+        excluded = failed_versions.get(pkg, set())
 
-        # For AttributeError, prefer older versions
-        pick = VersionSelector.pick_by_binary_search(
-            versions, failed_list, prefer_newer=False
+        new_ver = self._choose_version(
+            package=pkg,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules[pkg],
+            prefer_older=True,
         )
-        if pick:
-            state["resolved_modules"][module] = pick
-            if self.logging:
-                print(f"[EPLLM] AttributeError: {module} -> {pick}")
+
+        if new_ver:
+            modules[pkg] = new_ver
             return True
 
         return False
 
-    def _handle_dependency_conflict(self, state: SnippetState,
-                                    module: Optional[str]) -> bool:
-        """Handle dependency conflicts by trying compatible versions."""
-        if not module or module not in state["resolved_modules"]:
-            return False
-
-        failed_list = state["failed_versions"].get(module, [])
-        versions = self._get_version_list(module, state["python_version"])
-
-        # Try compatibility-aware selection
-        pick = VersionSelector.select(
-            module, versions, failed_list, state["iteration"],
-            resolved_modules=state["resolved_modules"]
-        )
-        if pick:
-            state["resolved_modules"][module] = pick
-            return True
-
-        return False
-
-    def _handle_invalid_version(self, state: SnippetState,
-                                module: Optional[str]) -> bool:
-        """Handle InvalidVersion by picking a proper version."""
+    def _fix_non_zero_code(self, error, modules, version_cache,
+                           failed_versions, python_version, iteration):
+        """Fix: handle pip install failure (compilation error, missing dep)."""
+        module = error.module
         if not module:
             return False
 
-        failed_list = state["failed_versions"].get(module, [])
-        versions = self._get_version_list(module, state["python_version"])
+        if module not in modules:
+            return False
 
-        pick = VersionSelector.pick_latest(versions, failed_list)
-        if pick:
-            state["resolved_modules"][module] = pick
+        # Track failed version
+        failed_versions.setdefault(module, set()).add(modules[module])
+        versions = self._get_package_versions(module, python_version, version_cache)
+        excluded = failed_versions.get(module, set())
+
+        # Check if it's a compilation error (Cython, C extension)
+        if 'Cython' in error.message or 'gcc' in error.message or 'setup.py' in error.message:
+            # Try a different version (often older wheel-based versions work)
+            new_ver = self._choose_version(
+                package=module,
+                versions=versions,
+                python_version=python_version,
+                iteration=iteration,
+                excluded=excluded,
+                error=error,
+                current_version=modules[module],
+                prefer_older=True,
+            )
+            if new_ver:
+                modules[module] = new_ver
+                return True
+
+            # If all versions fail to compile, remove the package
+            modules.pop(module, None)
             return True
 
-        # Remove if no valid version found
-        if module in state["resolved_modules"]:
-            del state["resolved_modules"][module]
+        # Try different version
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules[module],
+            prefer_older=True,
+        )
+        if new_ver:
+            modules[module] = new_ver
+            return True
+
+        # Remove the package as last resort
+        modules.pop(module, None)
         return True
 
-    # --- Adaptive RAG: LLM-assisted error recovery ---
+    def _fix_syntax_error(self, error, modules, version_cache,
+                          failed_versions, python_version, iteration):
+        """Fix: SyntaxError in an installed module (version mismatch)."""
+        module = error.module
+        if not module:
+            # SyntaxError in snippet itself - need different Python version
+            return False
 
-    def _llm_error_recovery(self, state: SnippetState, log: str) -> bool:
-        """Use LLM to analyze error and suggest fix when deterministic handling fails.
+        if module not in modules:
+            return False
 
-        This is the 'adaptive' part of adaptive RAG: the LLM gets the error context
-        plus available version lists (retrieved from cache) to make an informed decision.
-        """
-        if self.logging:
-            print(f"[EPLLM] Adaptive RAG: consulting LLM for error recovery "
-                  f"(iter {state['iteration']})")
+        # Track and try older version
+        failed_versions.setdefault(module, set()).add(modules[module])
+        versions = self._get_package_versions(module, python_version, version_cache)
+        excluded = failed_versions.get(module, set())
 
-        # Build the context for LLM — this is the RAG retrieval step
-        error_details = {
-            "error_modules": {}
-        }
-        for mod, vers in state["failed_versions"].items():
-            error_details["error_modules"][mod] = vers
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules[module],
+            prefer_older=True,
+        )
 
-        llm_eval = {
-            "python_version": state["python_version"],
-            "python_modules": state["resolved_modules"],
-        }
-
-        try:
-            # Use the OllamaHelper's process_error which routes to
-            # specialized LLM prompts for each error type
-            output, error_type = self.llm.process_error(
-                log[:3000],  # Truncate long logs
-                error_details,
-                llm_eval
-            )
-
-            if self.logging:
-                print(f"[EPLLM] LLM suggested: type={error_type}, output={output}")
-
-            if output and isinstance(output, dict):
-                mod = output.get("module")
-                ver = output.get("version")
-
-                if mod and ver and ver != "None" and ver is not None:
-                    # Validate the version string
-                    ver_str = str(ver).strip()
-                    if len(ver_str) <= 25 and any(c.isdigit() for c in ver_str):
-                        # Check if this module name needs resolution
-                        canonical = self.pypi.check_module_name(mod)
-                        mod_name = canonical[0] if canonical else mod
-
-                        # Skip system packages
-                        if self.error_parser.is_system_package(mod_name):
-                            if mod_name in state["resolved_modules"]:
-                                del state["resolved_modules"][mod_name]
-                            return True
-
-                        state["resolved_modules"][mod_name] = ver_str
-                        if self.logging:
-                            print(f"[EPLLM] LLM fix: {mod_name}=={ver_str}")
-                        return True
-
-                # LLM identified the module but couldn't find a version
-                if mod:
-                    canonical = self.pypi.check_module_name(mod)
-                    mod_name = canonical[0] if canonical else mod
-                    if mod_name in state["resolved_modules"]:
-                        del state["resolved_modules"][mod_name]
-                        if self.logging:
-                            print(f"[EPLLM] LLM says remove: {mod_name}")
-                        return True
-
-            # If LLM returned a string (from non_zero_error), it's a module name
-            if output and isinstance(output, str):
-                mod_name = output
-                if mod_name in state["resolved_modules"]:
-                    del state["resolved_modules"][mod_name]
-                    return True
-
-        except Exception as e:
-            if self.logging:
-                print(f"[EPLLM] LLM error recovery failed: {e}")
+        if new_ver:
+            modules[module] = new_ver
+            return True
 
         return False
 
-    # --- Cleanup ---
+    def _fix_invalid_version(self, error, modules, version_cache,
+                             failed_versions, python_version, iteration):
+        """Fix: invalid version string."""
+        module = error.module
+        if not module or module not in modules:
+            return False
 
-    def _cleanup(self, docker: DockerHelper):
-        """Delete container and image."""
+        failed_versions.setdefault(module, set()).add(modules[module])
+        versions = self._get_package_versions(module, python_version, version_cache)
+        excluded = failed_versions.get(module, set())
+
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+        )
+        if new_ver:
+            modules[module] = new_ver
+            return True
+
+        return False
+
+    def _fix_generic_version(self, error, modules, version_cache,
+                             failed_versions, python_version, iteration):
+        """Fix: try downgrading the most likely offending module."""
+        # Try to find the module from the error message
+        module = error.module
+        if not module:
+            # Check each installed module in the error message
+            for pkg in modules:
+                if pkg in error.message:
+                    module = pkg
+                    break
+
+        if not module:
+            return False
+
+        if module not in modules:
+            pkg = map_import_to_package(module)
+            if pkg and pkg in modules:
+                module = pkg
+            else:
+                return False
+
+        failed_versions.setdefault(module, set()).add(modules[module])
+        versions = self._get_package_versions(module, python_version, version_cache)
+        excluded = failed_versions.get(module, set())
+
+        new_ver = self._choose_version(
+            package=module,
+            versions=versions,
+            python_version=python_version,
+            iteration=iteration,
+            excluded=excluded,
+            error=error,
+            current_version=modules[module],
+            prefer_older=True,
+        )
+        if new_ver:
+            modules[module] = new_ver
+            return True
+
+        return False
+
+    # ── Logging ──────────────────────────────────────────────────────────
+
+    def _log_result(self, snippet_path, python_version, modules,
+                    error_type, error_msg, iteration, start_time, success):
+        """Log iteration result to YAML file (PLLM-compatible format)."""
+        project_dir = os.path.dirname(snippet_path)
+        log_file = os.path.join(project_dir, f"output_data_{python_version}.yml")
+
         try:
-            docker.delete_container()
-        except Exception:
-            pass
-        try:
-            docker.delete_image()
-        except Exception:
+            with open(log_file, 'a') as f:
+                if iteration == 1:
+                    f.write('---\n')
+                    f.write(f"python_version: {python_version}\n")
+                    f.write(f"start_time: {start_time}\n")
+                    f.write('iterations:\n')
+
+                f.write(f"  iteration_{iteration}:\n")
+                f.write(f"    - python_module: {modules}\n")
+                f.write(f"    - error_type: {error_type}\n")
+                f.write(f"    - error: |\n")
+                for line in str(error_msg)[:500].split('\n'):
+                    if line.strip():
+                        f.write(f"        {line}\n")
+
+                if success:
+                    end_time = time.time()
+                    f.write(f"end_time: {end_time}\n")
+                    f.write(f"total_time: {end_time - start_time}\n")
+        except (IOError, OSError):
             pass

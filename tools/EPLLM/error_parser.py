@@ -1,192 +1,268 @@
+"""Regex-based error classification from Docker build/run output.
+
+Replaces PLLM's LLM-based error parsing with fast deterministic regex.
+Handles all 8+ error types with structured information extraction.
+"""
 import re
-from typing import Optional, Tuple, List
+from EPLLM.state import ErrorInfo  # noqa: E402
 
 
-class ErrorParser:
-    """Regex-based error parser replacing LLM error diagnosis."""
+def parse_error(output):
+    """Classify and extract structured info from Docker build/run output.
 
-    # Patterns for error type detection
-    VERSION_NOT_FOUND = re.compile(
-        r"Could not find a version that satisfies the requirement\s+(\S+)==(\S+)"
-    )
-    MODULE_NOT_FOUND = re.compile(
-        r"ModuleNotFoundError:\s*No module named ['\"]?([a-zA-Z0-9_.]+)['\"]?"
-    )
-    IMPORT_ERROR_NO_MODULE = re.compile(
-        r"ImportError:\s*No module named\s+['\"]?([a-zA-Z0-9_.]+)['\"]?"
-    )
-    IMPORT_ERROR_CANNOT = re.compile(
-        r"ImportError:\s*cannot import name ['\"]?(\w+)['\"]? from ['\"]?([a-zA-Z0-9_.]+)['\"]?"
-    )
-    ATTRIBUTE_ERROR = re.compile(
-        r"AttributeError:\s*(?:module\s+['\"]?([a-zA-Z0-9_.]+)['\"]?\s+has no attribute|'module' object has no attribute)"
-    )
-    SYNTAX_ERROR = re.compile(r"SyntaxError:\s*(?:invalid syntax|Missing parentheses)")
-    NON_ZERO_CODE = re.compile(
-        r"pip install\s+\S+\s+(\S+)==(\S+).*returned a non-zero code"
-    )
-    DEPENDENCY_CONFLICT = re.compile(r"dependency conflict", re.IGNORECASE)
-    INVALID_VERSION = re.compile(r"InvalidVersion", re.IGNORECASE)
+    Returns an ErrorInfo with the error type and extracted details.
+    Error types: VersionNotFound, DependencyConflict, ModuleNotFound,
+    ImportError, AttributeError, SyntaxError, NonZeroCode, InvalidVersion,
+    NameError, TypeError, OtherError, NoError.
+    """
+    if not output or not isinstance(output, str):
+        return ErrorInfo('NoError')
 
-    # Extract available versions from "from versions: ..." in error messages
-    AVAILABLE_VERSIONS = re.compile(
-        r"from versions:\s*([0-9][0-9a-zA-Z.,\s]*)\)"
-    )
+    # ── VersionNotFound ──────────────────────────────────────────────────
+    if 'Could not find a version' in output:
+        return _parse_version_not_found(output)
 
-    # Python 2 markers in code
-    PY2_PRINT = re.compile(r"^\s*print\s+['\"\w]", re.MULTILINE)
-    PY2_URLLIB2 = re.compile(r"(?:^|\s)import\s+urllib2|from\s+urllib2\s+", re.MULTILINE)
-    PY2_EXECFILE = re.compile(r"\bexecfile\s*\(", re.MULTILINE)
-    PY2_RAW_INPUT = re.compile(r"\braw_input\s*\(", re.MULTILINE)
-    PY2_XRANGE = re.compile(r"\bxrange\s*\(", re.MULTILINE)
-    PY2_HAS_KEY = re.compile(r"\.has_key\s*\(", re.MULTILINE)
-    PY2_EXCEPT_COMMA = re.compile(r"except\s+\w+\s*,\s*\w+\s*:", re.MULTILINE)
+    # ── DependencyConflict ───────────────────────────────────────────────
+    if 'dependency conflict' in output.lower() or 'incompatible' in output.lower():
+        return _parse_dependency_conflict(output)
 
-    # Non-PyPI system packages that frequently fail
-    SYSTEM_PACKAGES = {
-        "gtk", "gi", "gobject", "glib", "appindicator", "dbus",
-        "apt", "apt_pkg", "aptdaemon", "software_properties",
-        "xdg", "Xlib", "cairo", "pango", "atk", "wnck",
-        "gconf", "gnome", "gnomekeyring", "pynotify",
-        # Local / non-pip modules commonly found in gists
-        "input_data", "util", "utils", "helper", "helpers", "config",
-        "settings", "models", "views", "urls", "forms", "admin",
-        "blog_main", "webapp2", "conf", "local_settings",
-        # Cinema 4D, Maya, Blender, etc. (non-pip)
-        "c4d", "c4ddev", "maya", "pymel", "cmds", "bpy",
-        "nuke", "houdini", "hou", "substance",
-        # Sublime Text plugins
-        "sublime", "sublime_plugin",
-        # RPi-specific
-        "RPi", "smbus", "spidev", "wiringpi",
-        # IDE / runtime-only modules
-        "rospy", "roslib", "catkin", "odbaccess", "abaqus",
-        # Google App Engine
-        "google.appengine",
-    }
+    # ── ModuleNotFoundError (runtime) ────────────────────────────────────
+    if 'ModuleNotFoundError' in output:
+        return _parse_module_not_found(output)
 
-    # Additional patterns for build errors
-    COULD_NOT_BUILD = re.compile(
-        r"Could not build wheels for (\S+)", re.IGNORECASE
-    )
-    NO_MATCHING_DIST = re.compile(
-        r"No matching distribution found for (\S+)==(\S+)"
-    )
+    # ── ImportError ──────────────────────────────────────────────────────
+    if 'ImportError' in output:
+        return _parse_import_error(output)
 
-    def detect_python2(self, source_code: str) -> bool:
-        """Heuristic Python 2 detection from source code."""
-        markers = [
-            self.PY2_PRINT, self.PY2_URLLIB2, self.PY2_EXECFILE,
-            self.PY2_RAW_INPUT, self.PY2_XRANGE, self.PY2_HAS_KEY,
-            self.PY2_EXCEPT_COMMA,
-        ]
-        hits = sum(1 for p in markers if p.search(source_code))
-        return hits >= 2
+    # ── SyntaxError ──────────────────────────────────────────────────────
+    if 'SyntaxError' in output:
+        return _parse_syntax_error(output)
 
-    def parse_error(self, log: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """Parse an error log and return (error_type, module_name, version).
+    # ── AttributeError ───────────────────────────────────────────────────
+    if 'AttributeError' in output:
+        return _parse_attribute_error(output)
 
-        Returns:
-            (error_type, module_name, failed_version)
-        """
-        if not log:
-            return ("None", None, None)
+    # ── NonZeroCode (pip install failure) ────────────────────────────────
+    if 'non-zero code' in output or 'returned a non-zero' in output:
+        return _parse_non_zero_code(output)
 
-        # Order matters: check more specific patterns first
-        m = self.VERSION_NOT_FOUND.search(log)
+    # ── InvalidVersion ───────────────────────────────────────────────────
+    if 'InvalidVersion' in output:
+        return _parse_invalid_version(output)
+
+    # ── NameError ────────────────────────────────────────────────────────
+    if 'NameError' in output:
+        return ErrorInfo('NameError', message=output[:500])
+
+    # ── TypeError ────────────────────────────────────────────────────────
+    if 'TypeError' in output:
+        return ErrorInfo('TypeError', message=output[:500])
+
+    # ── Check for any traceback (runtime error) ──────────────────────────
+    if 'Traceback (most recent call last)' in output:
+        return ErrorInfo('OtherError', message=output[:500])
+
+    # ── Check for ERROR in build output ──────────────────────────────────
+    if 'ERROR' in output or 'errorDetail' in output:
+        return _parse_generic_error(output)
+
+    return ErrorInfo('NoError')
+
+
+def _parse_version_not_found(output):
+    """Extract module name and available versions from pip's error."""
+    # Pattern: "requirement package_name==version (from versions: v1, v2, ...)"
+    m = re.search(r'requirement\s+(\S+?)(?:==\S+)?\s+\(from versions:\s*([^)]+)\)', output)
+    module = None
+    available = []
+    if m:
+        module = m.group(1).strip()
+        available = [v.strip() for v in m.group(2).split(',') if v.strip()]
+    else:
+        # Fallback: look for the pip install command
+        m = re.search(r'pip install[^"]*"([^"=]+)==([^"]+)"', output)
         if m:
-            return ("VersionNotFound", m.group(1), m.group(2))
+            module = m.group(1).strip()
+        else:
+            m = re.search(r'No matching distribution found for\s+(\S+)', output)
+            if m:
+                module = m.group(1).split('==')[0].strip()
 
-        if self.DEPENDENCY_CONFLICT.search(log):
-            # Try to extract module from the conflict message
-            mod_match = re.search(r"(\S+)==\S+", log)
-            mod = mod_match.group(1) if mod_match else None
-            return ("DependencyConflict", mod, None)
+    return ErrorInfo('VersionNotFound', module=module,
+                     available_versions=available, message=output[:500])
 
-        if self.INVALID_VERSION.search(log):
-            mod_match = re.search(r"(\S+)==(\S+)", log)
-            if mod_match:
-                return ("InvalidVersion", mod_match.group(1), mod_match.group(2))
-            return ("InvalidVersion", None, None)
 
-        m = self.NON_ZERO_CODE.search(log)
+def _parse_dependency_conflict(output):
+    """Extract conflict details from pip's dependency resolution error."""
+    # Pattern: "package X requires Y>=V, but you have Y==V2"
+    module = None
+    required_by = None
+    required_version = None
+
+    m = re.search(r'(\S+)\s+requires\s+(\S+?)([><=!]+\S+)?(?:,|\s|$)', output)
+    if m:
+        required_by = m.group(1).strip()
+        module = m.group(2).strip().lower()
+        required_version = m.group(3) if m.group(3) else None
+
+    if not module:
+        # Fallback: look for "is incompatible" patterns
+        m = re.search(r'(\S+)==\S+\s+is incompatible', output)
         if m:
-            return ("NonZeroCode", m.group(1), m.group(2))
+            module = m.group(1).strip()
 
-        m = self.MODULE_NOT_FOUND.search(log)
+    return ErrorInfo('DependencyConflict', module=module,
+                     required_by=required_by, required_version=required_version,
+                     message=output[:500])
+
+
+def _parse_module_not_found(output):
+    """Extract missing module from ModuleNotFoundError."""
+    # Pattern: "No module named 'module_name'"
+    m = re.search(r"No module named '([^']+)'", output)
+    if not m:
+        m = re.search(r'No module named (\S+)', output)
+
+    module = None
+    if m:
+        module = m.group(1).strip().strip("'\"")
+        module = module.split('.')[0]  # top-level module
+
+    return ErrorInfo('ModuleNotFound', module=module, message=output[:500])
+
+
+def _parse_import_error(output):
+    """Extract module causing ImportError."""
+    module = None
+
+    # Pattern: "cannot import name 'X' from 'module'"
+    m = re.search(r"cannot import name '?(\w+)'?\s+from\s+'?(\w[^'\"]*)'?", output)
+    if m:
+        module = m.group(2).split('.')[0]
+    else:
+        # First, try to find the import statement in the traceback
+        # This is more reliable than parsing the error message alone.
+        # e.g., "from django.test.simple import X\nImportError: No module named simple"
+        # → should return "django", not "simple"
+        m = re.search(r'(?:from\s+(\S+)\s+import|import\s+(\S+)).*\n\s*ImportError', output)
         if m:
-            mod = m.group(1).split(".")[0]
-            return ("ModuleNotFound", mod, None)
+            imp = m.group(1) or m.group(2)
+            module = imp.split('.')[0]
+        else:
+            # Fallback: parse "ImportError: No module named X"
+            m = re.search(r'ImportError:\s*No module named\s+(\S+)', output)
+            if m:
+                missing = m.group(1).strip("'\"")
+                # Check if the missing name appears as a submodule in a from...import
+                # e.g., "from django.test.simple" → missing is "simple" → use "django"
+                parent_m = re.search(
+                    r'from\s+(\w[\w.]*)\.' + re.escape(missing) + r'\s+import',
+                    output
+                )
+                if parent_m:
+                    module = parent_m.group(1).split('.')[0]
+                else:
+                    module = missing.split('.')[0]
+            else:
+                # Last resort: any import line before ImportError
+                m = re.search(r'import\s+(\w+).*\n.*ImportError', output)
+                if m:
+                    module = m.group(1)
 
-        m = self.IMPORT_ERROR_NO_MODULE.search(log)
+    return ErrorInfo('ImportError', module=module, message=output[:500])
+
+
+def _parse_syntax_error(output):
+    """Extract info from SyntaxError."""
+    module = None
+
+    # Check if SyntaxError is in a site-packages file (module issue)
+    m = re.search(r'site-packages/(\w+)', output)
+    if m:
+        module = m.group(1)
+    else:
+        # Check if it's in the snippet itself (Python version issue)
+        if '/app/snippet.py' in output:
+            return ErrorInfo('SyntaxError', module=None,
+                             message='snippet_syntax_error')
+
+    return ErrorInfo('SyntaxError', module=module, message=output[:500])
+
+
+def _parse_attribute_error(output):
+    """Extract module causing AttributeError."""
+    module = None
+
+    # Pattern: "'module' object has no attribute 'X'"
+    # Look at the import/module in the traceback
+    lines = output.split('\n')
+    for i, line in enumerate(lines):
+        if 'AttributeError' in line:
+            # Look at previous lines for the module reference
+            for j in range(max(0, i - 5), i):
+                m = re.search(r'import\s+(\w+)', lines[j])
+                if m:
+                    module = m.group(1)
+                    break
+                m = re.search(r'from\s+(\w+)', lines[j])
+                if m:
+                    module = m.group(1)
+                    break
+            break
+
+    if not module:
+        # Pattern: "module 'X' has no attribute 'Y'"
+        m = re.search(r"module '(\w+)'", output)
         if m:
-            mod = m.group(1).split(".")[0]
-            return ("ImportError", mod, None)
+            module = m.group(1)
 
-        m = self.IMPORT_ERROR_CANNOT.search(log)
+    return ErrorInfo('AttributeError', module=module, message=output[:500])
+
+
+def _parse_non_zero_code(output):
+    """Extract failing module from pip install failure."""
+    module = None
+
+    # Pattern: "pip install ... package==version returned a non-zero code"
+    m = re.search(r'pip install[^"]*["\s](\S+)==(\S+)["\s].*(?:non-zero|returned)', output)
+    if m:
+        module = m.group(1).strip()
+    else:
+        # Look for the package in error detail
+        m = re.search(r'"pip","install"[^]]*"([^"=]+)==', output)
         if m:
-            # The parent module is more useful for version changes
-            mod = m.group(2).split(".")[0]
-            return ("ImportError", mod, None)
+            module = m.group(1).strip()
+        else:
+            m = re.search(r'pip install\s+\S+\s+\S+\s+(\S+)==', output)
+            if m:
+                module = m.group(1).strip()
 
-        m = self.ATTRIBUTE_ERROR.search(log)
-        if m:
-            mod = m.group(1) if m.group(1) else None
-            if mod:
-                mod = mod.split(".")[0]
-            return ("AttributeError", mod, None)
+    return ErrorInfo('NonZeroCode', module=module, message=output[:500])
 
-        if self.SYNTAX_ERROR.search(log):
-            return ("SyntaxError", None, None)
 
-        # Additional patterns
-        m = self.COULD_NOT_BUILD.search(log)
-        if m:
-            mod = m.group(1).split("==")[0].split(">")[0].split("<")[0]
-            return ("NonZeroCode", mod, None)
+def _parse_invalid_version(output):
+    """Extract module with invalid version."""
+    module = None
+    m = re.search(r'InvalidVersion.*?(\w[\w-]+)==', output)
+    if m:
+        module = m.group(1).strip()
+    return ErrorInfo('InvalidVersion', module=module, message=output[:500])
 
-        m = self.NO_MATCHING_DIST.search(log)
-        if m:
-            return ("VersionNotFound", m.group(1), m.group(2))
 
-        return ("None", None, None)
+def _parse_generic_error(output):
+    """Parse generic Docker build errors."""
+    module = None
+    # Try to find the package that caused the error
+    m = re.search(r'pip install[^"]*"?(\S+)==', output)
+    if m:
+        module = m.group(1).strip()
+    return ErrorInfo('OtherError', module=module, message=output[:500])
 
-    def extract_traceback_module(self, log: str, resolved_modules: dict) -> Optional[str]:
-        """Try to identify the failing module from a traceback by matching
-        against resolved module names in site-packages paths."""
-        # Match site-packages/module_name in traceback
-        matches = re.findall(r"site-packages/([a-zA-Z0-9_]+)", log)
-        for match in matches:
-            mod = match.lower()
-            if mod in resolved_modules:
-                return mod
-            # Check if any resolved module starts with this name
-            for rm in resolved_modules:
-                if rm.lower().startswith(mod) or mod.startswith(rm.lower()):
-                    return rm
-        return None
 
-    def extract_available_versions(self, log: str) -> List[str]:
-        """Extract version list from 'from versions: ...' in error messages."""
-        m = self.AVAILABLE_VERSIONS.search(log)
-        if not m:
-            return []
-        raw = m.group(1)
-        versions = [v.strip() for v in raw.split(",") if v.strip()]
-        return versions
-
-    def is_system_package(self, module_name: str) -> bool:
-        """Check if a module is likely a system-only (non-PyPI) package."""
-        return module_name.lower() in self.SYSTEM_PACKAGES
-
-    def has_python2_syntax_error(self, log: str) -> bool:
-        """Check if a SyntaxError in the log looks like Python 2 code running on Python 3."""
-        if "SyntaxError" not in log:
-            return False
-        # Common Python 2 syntax that fails on 3
-        py2_markers = [
-            "print ",  # print statement
-            "def quit_all(self) -> None:",  # arrow syntax in py2 context
-            "except ",
-        ]
-        return any(marker in log for marker in py2_markers)
+def is_python_version_error(error_info):
+    """Check if the error suggests we need a different Python version."""
+    if error_info.error_type == 'SyntaxError' and error_info.message == 'snippet_syntax_error':
+        return True
+    if error_info.error_type == 'SyntaxError' and error_info.module is None:
+        return True
+    return False

@@ -1,169 +1,184 @@
-"""Batch evaluator with multiprocessing."""
+"""Batch evaluation with multiprocessing and CSV output.
 
+Processes multiple snippets in parallel, collects results,
+and outputs in the normalized CSV format for comparison.
+"""
 import csv
-import glob
 import os
 import time
-import statistics
-from multiprocessing import Pool
-from typing import List, Dict, Optional
+import multiprocessing as mp
+from pathlib import Path
 
-from tools.EPLLM.resolver import SnippetResolver
+from EPLLM.resolver import SnippetResolver  # noqa: E402
+from EPLLM.state import ResolveResult  # noqa: E402
 
 
-def _run_one(args: tuple) -> Dict:
-    """Worker function for multiprocessing. Must be top-level for pickling."""
-    file_path, base_url, model, temp, max_iterations, modules_dir, logging = args
-
+def _resolve_snippet(args):
+    """Worker function for multiprocessing pool."""
+    snippet_path, config = args
+    snippet_id = os.path.basename(os.path.dirname(snippet_path))
     start = time.time()
+
     try:
         resolver = SnippetResolver(
-            base_url=base_url, model=model, temp=temp,
-            max_iterations=max_iterations, modules_dir=modules_dir,
-            logging=logging,
+            base_modules=config['base_modules'],
+            max_iterations=config['max_iterations'],
+            llm_base_url=config.get('llm_base_url', 'http://localhost:11434'),
+            llm_model=config.get('llm_model', 'phi3:medium'),
+            llm_temp=config.get('llm_temp', 0.3),
+            use_llm=config.get('use_llm', True),
+            logging=config.get('logging', False),
         )
-        state = resolver.resolve(file_path)
+        result = resolver.resolve(snippet_path)
     except Exception as e:
-        elapsed = time.time() - start
-        snippet_name = file_path.split("/")[-2] if "/" in file_path else "unknown"
-        return {
-            "id": snippet_name,
-            "name": snippet_name,
-            "result": "error",
-            "duration": round(elapsed, 2),
-            "python_modules": "",
-            "passed": False,
-            "error": str(e),
-        }
+        result = ResolveResult(
+            success=False, error_type='Exception',
+            error_message=str(e)[:200],
+            duration=time.time() - start,
+        )
 
-    elapsed = time.time() - start
-    modules_str = ", ".join(
-        f"{k}=={v}" for k, v in state.get("resolved_modules", {}).items()
-    )
-
-    passed = state.get("status") == "success"
-    result = "success" if passed else state.get("error_type", "failed")
-
-    return {
-        "id": state.get("snippet_name", "unknown"),
-        "name": state.get("snippet_name", "unknown"),
-        "result": result,
-        "duration": round(elapsed, 2),
-        "python_modules": modules_str,
-        "passed": passed,
-        "error": state.get("error_type", "") if not passed else "",
-    }
+    # Always set duration to wall-clock elapsed time
+    result.duration = time.time() - start
+    return snippet_id, result
 
 
-class Evaluator:
-    """Batch processor for snippet evaluation."""
+class BatchEvaluator:
+    """Evaluates multiple snippets in parallel and produces CSV results."""
 
-    CSV_COLUMNS = ["id", "name", "result", "duration", "python_modules", "passed", "error"]
+    def __init__(self, config):
+        self.config = config
+        self.results = []
 
-    def __init__(self, hard_gists_dir: str = "hard-gists",
-                 output_csv: str = "epllm-results/epllm_results.csv",
-                 base_url: str = "http://localhost:11434",
-                 model: str = "gemma2", temp: float = 0.2,
-                 max_iterations: int = 8, jobs: int = 1,
-                 limit: Optional[int] = None,
-                 modules_dir: str = "./modules",
-                 logging: bool = False):
-        self.hard_gists_dir = hard_gists_dir
-        self.output_csv = output_csv
-        self.base_url = base_url
-        self.model = model
-        self.temp = temp
-        self.max_iterations = max_iterations
-        self.jobs = jobs
-        self.limit = limit
-        self.modules_dir = modules_dir
-        self.logging = logging
+    def discover_snippets(self, base_dir, limit=None):
+        """Find all snippet.py files under the base directory."""
+        snippets = []
+        base = Path(base_dir)
 
-    def discover_snippets(self) -> List[str]:
-        """Find all snippet.py files in hard-gists subdirectories."""
-        pattern = os.path.join(self.hard_gists_dir, "*/snippet.py")
-        files = sorted(glob.glob(pattern))
-        if self.limit:
-            files = files[:self.limit]
-        return files
+        if base.is_file() and base.name.endswith('.py'):
+            return [str(base)]
 
-    def run_all(self) -> List[Dict]:
-        """Run evaluation on all discovered snippets using multiprocessing."""
-        snippets = self.discover_snippets()
-        if not snippets:
-            print("[EPLLM] No snippets found!")
-            return []
+        for snippet_dir in sorted(base.iterdir()):
+            if snippet_dir.is_dir():
+                snippet_file = snippet_dir / 'snippet.py'
+                if snippet_file.exists():
+                    snippets.append(str(snippet_file))
 
-        print(f"[EPLLM] Found {len(snippets)} snippets, "
-              f"running with {self.jobs} workers")
+        if limit and limit > 0:
+            snippets = snippets[:limit]
 
-        # Build args for each snippet
-        args_list = [
-            (f, self.base_url, self.model, self.temp,
-             self.max_iterations, self.modules_dir, self.logging)
-            for f in snippets
-        ]
+        return snippets
 
-        total_start = time.time()
+    def evaluate(self, snippets, workers=None):
+        """Run evaluation on all snippets using multiprocessing.
 
-        if self.jobs <= 1:
-            # Sequential for debugging
-            rows = [_run_one(a) for a in args_list]
+        Args:
+            snippets: List of snippet file paths.
+            workers: Number of parallel workers (default: cpu_count - 1).
+
+        Returns:
+            List of (snippet_id, ResolveResult) tuples.
+        """
+        if workers is None:
+            workers = max(1, mp.cpu_count() - 1)
+
+        # Prepare args for pool
+        args_list = [(s, self.config) for s in snippets]
+
+        total = len(snippets)
+        print(f"Evaluating {total} snippets with {workers} workers...")
+        start = time.time()
+        completed = 0
+
+        if workers == 1:
+            # Sequential mode (easier debugging)
+            for args in args_list:
+                snippet_id, result = _resolve_snippet(args)
+                self.results.append((snippet_id, result))
+                completed += 1
+                status = "PASS" if result.success else f"FAIL({result.error_type})"
+                print(f"  [{completed}/{total}] {snippet_id}: {status} "
+                      f"({result.duration:.1f}s)")
         else:
-            with Pool(processes=self.jobs) as pool:
-                rows = pool.map(_run_one, args_list)
+            # Parallel mode
+            with mp.Pool(workers) as pool:
+                for snippet_id, result in pool.imap_unordered(
+                    _resolve_snippet, args_list
+                ):
+                    self.results.append((snippet_id, result))
+                    completed += 1
+                    status = "PASS" if result.success else f"FAIL({result.error_type})"
+                    print(f"  [{completed}/{total}] {snippet_id}: {status} "
+                          f"({result.duration:.1f}s)")
 
-        total_elapsed = time.time() - total_start
+        elapsed = time.time() - start
+        passed = sum(1 for _, r in self.results if r.success)
+        print(f"\nCompleted in {elapsed:.1f}s")
+        print(f"Results: {passed}/{total} passed ({100*passed/total:.1f}%)")
 
-        self._write_csv(rows)
-        self._print_summary(rows, total_elapsed)
+        return self.results
 
-        return rows
+    def write_csv(self, output_path):
+        """Write results to CSV in the normalized comparison format.
 
-    def _write_csv(self, rows: List[Dict]):
-        """Write results to CSV."""
-        os.makedirs(os.path.dirname(self.output_csv) or ".", exist_ok=True)
+        Columns: id, name, result, duration, python_modules, passed
+        """
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
-        with open(self.output_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=self.CSV_COLUMNS)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['id', 'name', 'result', 'duration',
+                             'python_modules', 'passed'])
 
-        print(f"[EPLLM] Results written to {self.output_csv}")
+            for snippet_id, result in sorted(self.results, key=lambda x: x[0]):
+                if result.success:
+                    result_str = 'OtherPass'
+                else:
+                    result_str = result.error_type or 'Unknown'
 
-    def _print_summary(self, rows: List[Dict], total_time: float = 0):
-        """Print success rate, timing stats, and error distribution."""
-        total = len(rows)
+                modules_str = result.modules_str()
+
+                writer.writerow([
+                    snippet_id,
+                    snippet_id,
+                    result_str,
+                    f"{result.duration:.2f}",
+                    modules_str,
+                    result.success,
+                ])
+
+        print(f"Results written to {output_path}")
+
+    def print_summary(self):
+        """Print a summary of the evaluation results."""
+        total = len(self.results)
         if total == 0:
-            print("[EPLLM] No results to summarize.")
+            print("No results to summarize.")
             return
 
-        passed = sum(1 for r in rows if r["passed"])
-        durations = [r["duration"] for r in rows]
-        avg_dur = statistics.mean(durations) if durations else 0
-        med_dur = statistics.median(durations) if durations else 0
+        passed = sum(1 for _, r in self.results if r.success)
+        failed = total - passed
+        avg_time = sum(r.duration for _, r in self.results) / total
 
-        # Error distribution
-        error_counts: Dict[str, int] = {}
-        for r in rows:
-            if not r["passed"] and r["error"]:
-                err = r["error"]
-                error_counts[err] = error_counts.get(err, 0) + 1
+        # Count error types
+        error_counts = {}
+        for _, r in self.results:
+            if not r.success:
+                et = r.error_type or 'Unknown'
+                error_counts[et] = error_counts.get(et, 0) + 1
 
-        print("\n" + "=" * 60)
-        print(f"EPLLM Results Summary")
-        print("=" * 60)
-        print(f"Total snippets:  {total}")
-        print(f"Passed:          {passed} ({100 * passed / total:.1f}%)")
-        print(f"Failed:          {total - passed} ({100 * (total - passed) / total:.1f}%)")
-        print(f"Avg duration:    {avg_dur:.1f}s")
-        print(f"Median duration: {med_dur:.1f}s")
-        print(f"Total time:      {total_time:.1f}s")
+        print(f"\n{'='*50}")
+        print(f"EPLLM Evaluation Summary")
+        print(f"{'='*50}")
+        print(f"Total:     {total}")
+        print(f"Passed:    {passed} ({100*passed/total:.1f}%)")
+        print(f"Failed:    {failed} ({100*failed/total:.1f}%)")
+        print(f"Avg time:  {avg_time:.2f}s")
+        print()
 
         if error_counts:
-            print(f"\nError distribution:")
-            for err, count in sorted(error_counts.items(),
-                                     key=lambda x: -x[1]):
-                print(f"  {err}: {count}")
-        print("=" * 60)
+            print("Error breakdown:")
+            for et, count in sorted(error_counts.items(),
+                                    key=lambda x: -x[1]):
+                print(f"  {et:25s} {count:4d} ({100*count/total:.1f}%)")
+
+        print(f"{'='*50}")

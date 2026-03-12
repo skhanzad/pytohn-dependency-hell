@@ -8,7 +8,7 @@ workspace container by default.
 
 ## Build
 
-Run these commands on the host machine from `tools/EPLLM`:
+Run these commands on the host machine from the **repo root**:
 
 ```bash
 docker build \
@@ -17,6 +17,7 @@ docker build \
   --build-arg GID="$(id -g)" \
   --build-arg DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)" \
   -t epllm:latest \
+  -f tools/EPLLM/Dockerfile \
   .
 ```
 
@@ -33,7 +34,7 @@ instead of `stat -c`.
 ```bash
 docker run -it --rm \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
-  -v "$(pwd):/app" \
+  -v "$(pwd):/EPLLM" \
   --name epllm \
   epllm:latest bash
 ```
@@ -51,27 +52,27 @@ Single snippet, deterministic mode:
 ```bash
 docker run -it --rm \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
-  -v "$(pwd):/app" \
+  -v "$(pwd):/EPLLM" \
   --name epllm \
   epllm:latest \
   python -m EPLLM \
-  -f /app/path/to/snippet.py \
-  --modules-dir /app/modules \
+  -f /EPLLM/path/to/snippet.py \
+  --modules-dir /EPLLM/modules \
   --no-llm
 ```
 
-Batch mode:
+Batch mode (hard-gists are already baked into the image):
 
 ```bash
 docker run -it --rm \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
-  -v "$(pwd):/app" \
+  -v "$(pwd):/EPLLM" \
   --name epllm \
   epllm:latest \
   python -m EPLLM \
-  -d /app/hard-gists \
-  -o /app/epllm_results.csv \
-  --modules-dir /app/modules \
+  -d /EPLLM/hard-gists \
+  -o /EPLLM/epllm_results.csv \
+  --modules-dir /EPLLM/modules \
   --no-llm
 ```
 
@@ -84,12 +85,12 @@ server:
 docker run -it --rm \
   --add-host=host.docker.internal:host-gateway \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
-  -v "$(pwd):/app" \
+  -v "$(pwd):/EPLLM" \
   --name epllm \
   epllm:latest \
   python -m EPLLM \
-  -f /app/path/to/snippet.py \
-  --modules-dir /app/modules \
+  -f /EPLLM/path/to/snippet.py \
+  --modules-dir /EPLLM/modules \
   -b http://host.docker.internal:11434 \
   -m phi3:medium
 ```
@@ -105,18 +106,18 @@ To use a GPT model instead of Ollama:
 docker run -it --rm \
   -e OPENAI_KEY=your_api_key \
   -v /var/run/docker.sock:/var/run/docker.sock:rw \
-  -v "$(pwd):/app" \
+  -v "$(pwd):/EPLLM" \
   --name epllm \
   epllm:latest \
   python -m EPLLM \
-  -f /app/path/to/snippet.py \
-  --modules-dir /app/modules \
+  -f /EPLLM/path/to/snippet.py \
+  --modules-dir /EPLLM/modules \
   -m gpt-4.1-mini
 ```
 
 ## Notes
 
-- `/app/modules` is a good place to persist the PyPI cache and
+- `/EPLLM/modules` is a good place to persist the PyPI cache and
   `.epllm_success_memory.json`.
 - The default container command is `tail -f /dev/null`, matching `pllm`, so you
   can keep the container alive and run commands inside it.
